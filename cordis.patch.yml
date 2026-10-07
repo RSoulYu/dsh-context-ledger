@@ -1,0 +1,4 @@
+# context-ledger bundle patch：把插件挂进 profile
+- insert:
+    - id: context-ledger
+      name: 'dsh-context-ledger'

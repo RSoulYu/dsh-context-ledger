@@ -1,0 +1,54 @@
+{
+  "name": "dsh-context-ledger",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "DSH 上下文账本：把每个请求常驻注入的 token 成本，与实际调用次数对账，找出「贵且没用」的注入物。只读，零第三方依赖。",
+  "license": "MIT",
+  "author": "RSoulYu",
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "plugin",
+    "context",
+    "token",
+    "audit"
+  ],
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "lib",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-renderer",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ],
+      "immediately": true
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-tools": ">=0.2.0-rc.2"
+  },
+  "engines": {
+    "node": ">=22.19"
+  },
+  "scripts": {
+    "check": "node --check index.js && node --check client.js",
+    "test": "node --test"
+  }
+}

@@ -32,6 +32,9 @@ export const ENUM_CONSTANTS = new Set([
   'prechecked', 'unvalidated', 'unsupported',
   'not-in-restrictable-names', 'no-agent-scope', 'interface-absent', 'reserved-name',
   'one-time-invalidation',
+  // v4 · R8（§3.8 的 8 个新常量；全部是固定枚举常量 + 一个受 NAME_PATTERN 约束的 id）
+  'session-log-mtime', 'agent-session-id', 'http-session-param', 'unavailable',
+  'current-session', 'historical-only', 'absent', 'model-tool-calls-in-window',
 ])
 
 /** 与 lib/usage.js 一致的护栏（此处独立声明，避免用被测常量自证）。 */
@@ -80,6 +83,33 @@ export function isWhitelisted(value) {
     return ABSOLUTE_PATH.test(name) || NAME_PATTERN.test(name)
   }
   return false
+}
+
+/**
+ * v4（§3.8 / §3.4 S3）：`scope.currentSession.id` 是**唯一**新增的"受护栏约束的运行时字符串"。
+ *
+ * 它必须先过 `NAME_PATTERN` 才能进产物（不匹配即按"取不到"处理）。这条在这里独立复算，
+ * 而不是靠 `isWhitelisted` 的通用 `NAME_PATTERN` 分支"顺带"通过——否则
+ * "id 必须过护栏"这条硬规则会退化成永真的空断言。
+ *
+ * @param {unknown} report
+ * @returns {string[]} 违规说明（空数组 = 通过）
+ */
+export function currentSessionIdOffenders(report) {
+  const current = report?.scope?.currentSession
+  if (current === null || typeof current !== 'object') return ['scope.currentSession 缺失（§2.2 必需）']
+  const problems = []
+  if (current.id !== null && !NAME_PATTERN.test(current.id)) {
+    problems.push(`currentSession.id 未过 NAME_PATTERN: ${String(current.id)}`)
+  }
+  if ((current.basis === 'unavailable') !== (current.id === null)) {
+    problems.push('currentSession：basis === "unavailable" ⟺ id === null 不成立')
+  }
+  if (!['agent-session-id', 'http-session-param', 'unavailable'].includes(current.basis)) {
+    problems.push(`currentSession.basis 取值越域: ${String(current.basis)}`)
+  }
+  if (typeof current.inWindow !== 'boolean') problems.push('currentSession.inWindow 不是布尔')
+  return problems
 }
 
 /**

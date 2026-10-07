@@ -15,7 +15,7 @@ import assert from 'node:assert/strict'
 import { reconcile, renderLedger } from '../lib/reconcile.js'
 import { attributeNames, scanCorpus } from '../lib/provide.js'
 import { countToolCalls } from '../lib/usage.js'
-import { allStrings, isWhitelisted, whitelistOffenders } from './whitelist.js'
+import { allStrings, currentSessionIdOffenders, isWhitelisted, whitelistOffenders } from './whitelist.js'
 
 const SENTINEL = 'LEDGER-PRIVACY-SENTINEL-8f3a'
 const SENTINEL_CJK = '机密正文-绝对不许出现在产物里-🙂'
@@ -98,21 +98,32 @@ function reportFor(lines) {
         restrictableNames: ['bash', 'read', 'mcp__openviking__find'],
         mode: 'suggestion-only',
       },
+      // v4（R8）：让 S1/S2/S3 覆盖窗口字段与三态的全部新字符串类别
+      // （`session-log-mtime` / `agent-session-id` / `current-session` / `historical-only` /
+      //   `absent` / `model-tool-calls-in-window` / `unavailable`，以及受护栏约束的 currentSession.id）
       scope: {
         workspaceKey: '--w--',
         sessionsRoot: '/home/u/.dsh/sessions',
-        sessionsAvailable: 1,
-        sessionsScanned: 1,
+        sessionsAvailable: 3,
+        sessionsScanned: 2,
         sessionsUnreadable: 0,
         sessionsLimit: 20,
+        sessionsOutsideWindow: 1,
         windowStart: '2026-10-07T00:00:00.000Z',
         windowEnd: '2026-10-07T01:00:00.000Z',
+        windowBasis: 'session-log-mtime',
+        currentSession: {
+          id: '9f8e7d6c-5b4a-3928-8170-a1b2c3d4e5f6', basis: 'agent-session-id', inWindow: true,
+        },
         linesRead: usage.linesRead,
         skillToolCalls: usage.skillToolCalls,
         namesRejected: usage.namesRejected,
         truncated: usage.truncated,
         providerScan: { packages: 2, files: 9, bytes: 4096, capped: false },
       },
+      // 三态的两个通道（§7.1 规则 5）：`{}` = 已判定；未列出的名字 ⇒ 0
+      sessionCoverage: { bash: 1 },
+      currentSessionCallsByName: { bash: 2, read: 0, never_called_tool: 0 },
       items: [
         { id: 'tools:bash', category: 'tools', name: 'bash', tokens: 120, source: 'native', bytes: 480 },
         { id: 'tools:read', category: 'tools', name: 'read', tokens: 80, source: 'native', bytes: 320 },
@@ -241,6 +252,37 @@ test('S3 · R6 字符串类别：hidePlan/hideApply/hidePlanCaveat 全部命中�
   assert.equal(isWhitelisted('safe to hide 无损失'), false)
 })
 
+test('S3 · R8（v4）字符串类别：窗口与三态的新常量全部命中白名单，且 currentSession.id 受护栏约束', () => {
+  const { report } = reportFor(logWith(SENTINEL))
+  const findings = report.findings
+  // 三态在产物里真的都出现过（不是靠白名单空转）
+  assert.equal(findings.zeroCallBasis, 'model-tool-calls-in-window')
+  assert.equal(report.scope.windowBasis, 'session-log-mtime')
+  assert.equal(report.scope.currentSession.basis, 'agent-session-id')
+  const presence = new Set(report.items.map(item => item.callPresence))
+  assert.equal(presence.has('current-session'), true) // bash：本会话用过
+  assert.equal(presence.has('historical-only'), true) // find/read：本会话没用过
+  assert.equal(report.items.some(item => item.callPresence === null), true) // instructions/skills
+
+  // S3 全字符串白名单（含 v4 的 8 个新常量）
+  assert.deepEqual(allStrings(report).filter(value => !isWhitelisted(value)), [])
+  // v4 独立复算：`scope.currentSession.id` 必须过 NAME_PATTERN，且 basis/inWindow 自洽
+  assert.deepEqual(currentSessionIdOffenders(report), [])
+
+  // 反向校验：v4 的 8 个新常量确实在白名单里，而正文形态仍被挡
+  for (const value of ['session-log-mtime', 'agent-session-id', 'http-session-param', 'unavailable',
+    'current-session', 'historical-only', 'absent', 'model-tool-calls-in-window']) {
+    assert.equal(isWhitelisted(value), true, `${value} 应在白名单里`)
+  }
+  // 违规 id 必须被 currentSessionIdOffenders 抓到（否则这条规则是永真的空断言）
+  const withBadId = { ...report, scope: { ...report.scope, currentSession: { id: 'has space 中文', basis: 'agent-session-id', inWindow: true } } }
+  assert.equal(currentSessionIdOffenders(withBadId).length, 1)
+  const withBadBasis = { ...report, scope: { ...report.scope, currentSession: { id: 'sess-a', basis: 'unavailable', inWindow: true } } }
+  assert.ok(currentSessionIdOffenders(withBadBasis).length >= 1)
+  assert.equal(isWhitelisted('has space 中文'), false)
+  assert.equal(isWhitelisted('logging mtime of the newest session'), false)
+})
+
 test('S3 · R1 字符串类别：插件包名 / evidenceFile / candidates / prunePlan 全部命中白名单', () => {
   const { report } = reportFor(logWith(SENTINEL))
   assert.equal(report.items.find(item => item.name === 'never_called_tool').providedBy.kind, 'plugin')
@@ -261,6 +303,7 @@ test('S2 只归一化 generatedAt：其余字段（含 cwd/时间窗）本就与
   const { report } = reportFor(logWith(SENTINEL))
   assert.equal(report.cwd, '/w')
   assert.equal(report.scope.windowStart, '2026-10-07T00:00:00.000Z')
+  assert.equal(report.scope.windowBasis, 'session-log-mtime')
   // 产物里不允许出现任何「内容派生」字段（如 schemaHash / 片段预览）
   const keys = new Set()
   for (const item of report.items) for (const key of Object.keys(item)) keys.add(key)

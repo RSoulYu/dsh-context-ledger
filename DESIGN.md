@@ -1,13 +1,16 @@
-# dsh-context-ledger DESIGN — 数据契约 · 隐私边界 · 面板层级（v3，已冻结）
+# dsh-context-ledger DESIGN — 数据契约 · 隐私边界 · 面板层级（v4，已冻结）
 
-> 状态：**FROZEN v3**（2026-10-07，任务 t13 / 触发 R6；v2 由任务 t5 触发 R1，v1 由任务 t1 冻结）
+> 状态：**FROZEN v4**（2026-10-07，任务 t1 / 触发 R8；v3 由任务 t13 触发 R6，v2 由任务 t5 触发 R1，v1 由任务 t1 冻结）
 > 读者：实现线（宿主半区 / 客户端面板）、验证线、队长。
-> 约束来源：[BRIEF.md](./BRIEF.md)（范围红线、隐私红线、环境事实、授权边界）+ [BACKLOG.md](./BACKLOG.md) R1 + [IMPLEMENTATION-NOTES.md](./IMPLEMENTATION-NOTES.md)。
+> 约束来源：[BRIEF.md](./BRIEF.md)（范围红线、隐私红线、环境事实、授权边界）+ [BACKLOG.md](./BACKLOG.md) R1/R6/R8 + [IMPLEMENTATION-NOTES.md](./IMPLEMENTATION-NOTES.md)。
 > 变更控制：本文件冻结的**字段名、语义、排序规则、常量**不得由实现线自行改名或"顺手优化"。
 > 需要变更时，必须另开任务并在此文件 `## 8. 修订记录` 追加一条，实现线照新版本施工。
 > 文档结构：§0–§8 为 v1 既有骨架（**章节号不重排**，避免击穿 IMPLEMENTATION-NOTES / VERIFY-T4 的既有引用）；
 > v2 新增内容追加为 §2.13–§2.17（R1 契约）、§9（文件归属矩阵）、§10（决策信封）；
-> v3 新增内容追加为 §2.18–§2.25（R6 契约）、§3.7、§4.8、§9.1。
+> v3 新增内容追加为 §2.18–§2.25（R6 契约）、§3.7、§4.8、§9.1；
+> v4 新增内容追加为 §2.26（R8 三态调用口径 + 窗口边界）、§3.8、§4.9、§9.2；
+> v4 的**就地修订**（§1、§2.1、§2.2、§2.3、§2.4–§2.6、§2.9–§2.12、§3.2、§3.4、§4.1、§4.2、§4.4、§4.5、§4.8、§5、§6、§7、§7.1、§7.2）逐条列在 §8 的 v4 变更清单里。
+> v4 的**新增小节**为 §2.26（R8 三态调用口径 + 窗口边界）、§3.8（不新增读取面）、§4.9（面板呈现义务）、§9.2（R8 文件归属）。
 
 本文只冻结契约，不含实现代码。每一项各有唯一结论，不留"两种都行"。
 
@@ -19,6 +22,14 @@
 **v2 → v3 的不兼容变更（实现线必须同步）**：canonical `version` 由 `2` 升到 `3`（新增必需字段 = 形状变更）；
 `findings.hidePlan` / `hidePlanTokens` / `hidePlanUnits` / `hidePlanBasis` / `hidePlanStatus` / `hideApply` / `hidePlanCaveat` 为 v3 新增（§2.18–§2.25）；
 R6 **只输出建议、不自动施加**（§2.23.4）。逐条见 §8。
+
+**v3 → v4 的不兼容变更（实现线必须同步）**：canonical `version` 由 `3` 升到 `4`（新增必需字段 = 形状变更）；
+`items[].currentSessionCalls` / `items[].sessionsWithCalls` / `items[].callPresence`、
+`scope.currentSession` / `scope.windowBasis` / `scope.sessionsOutsideWindow`、
+`totals.currentSessionObservedCalls`、`findings.zeroCallBasis` 为 v4 新增（§2.2、§2.4、§2.6、§2.26）；
+`scope.windowStart` / `windowEnd` 由"可为 null"收紧为**不变量**（§2.2 W1–W3）；
+`ReconcileInput` 补齐 R6 与 v4 的输入通道（§7.1，一并收口 F2/C1）。逐条见 §8。
+**v4 的语义要点**：`calls` 仍是**扫描窗口内**的调用总数（**不是**穷尽磁盘），v4 只是把这个口径**显式化**并加上"本会话 / 覆盖会话数"两个维度；`zeroCall` 语义**一字未改**。
 
 ---
 
@@ -35,6 +46,14 @@ v2 追加一层**归属与候选**：`items[].providedBy` 回答"这个工具由
 且**每条都标注置信度与判定手段**），`findings.prunePlan` 汇总为"**从未被模型调用的常驻项候选**"——
 它是**人工判断的输入，不是卸载建议**：模型调用次数只能证明"没被模型调用"，不能证明"没用"
 （该功能可能走 UI / 后台流程 / 极低频关键操作）。契约里成本是事实、归属是启发式、用处是未知，三者必须可区分。
+
+v4 把"调用次数"这一个数字**拆成三个互不可加的维度**，并把窗口边界写成不变量（§2.26）：
+`calls`（**扫描窗口内**总调用；**不是**穷尽磁盘）· `currentSessionCalls`（**本会话**调用）·
+`sessionsWithCalls`（窗口内**覆盖会话数**，分母为 `scope.sessionsScanned`），外加三态判定 `callPresence`
+（`"current-session"` / `"historical-only"` / `"absent"`）。存在的理由是一个真实困惑：
+某工具在全部 40 个会话里被调用过，但在最近 20 个里为 0 —— 只看窗口口径的 `calls` **无法回答**
+"到底是没用，还是只是最近没用"。v4 的答案不是去穷尽磁盘（无上界），而是**把窗口说清楚**
+（`windowStart`/`windowEnd`/`windowBasis`/`sessionsOutsideWindow`）并给出"我此刻在不在用"这一维。
 
 ---
 
@@ -53,6 +72,8 @@ v2 追加一层**归属与候选**：`items[].providedBy` 回答"这个工具由
 | 技能调用机制 | **只有一个** `skill` 工具（`name: "skill"`，参数 `{ name: string }`），技能名在**参数**里 | `dsh-tool-skill/lib/index.js:55-67` |
 | 无技能激活事件 | 事件词汇表 54 项中没有任何 skill 级事件 | `known-event-types.js` 全量枚举核对 |
 | 无 MCP / 工具调用计数器服务 | 会话日志是唯一可复现的调用次数来源 | 检索 DSH checkout：无 tool 调用计数持久化 |
+| **会话身份（v4 核对）** | `agent.session.id`（= 会话目录名；由持久化 header 派生：`dsh-session/lib/index.js:1268` `get id() { return this.header.id }`）；`dsh-agent/lib/index.js:512` 同一取值形状 `agent.session.id` | 只读核对宿主源码；面板路由侧另有 `?session=<id>`（§4.1） |
+| **窗口边界的可用元数据（v4 核对）** | 会话日志文件的 `mtime`（`fs.statSync(logPath).mtimeMs`，实现已在用） | `index.js:listWorkspaceSessions`：只 stat，不读内容 |
 | `~/.dsh/dsh-usage/usage-ledger.json` | 只有 provider/model 级 token 与 `calls`（模型请求数），**无工具名维度** | 实读该文件 → **不作为本插件数据源**（见 §6） |
 
 > 结论性推论（冻结）：
@@ -72,7 +93,7 @@ v2 追加一层**归属与候选**：`items[].providedBy` 回答"这个工具由
 | 字段 | 类型 | 单位/取值 | 含义 |
 |---|---|---|---|
 | `tool` | string | 常量 `"context_ledger"` | 工具标识，便于回执识别 |
-| `version` | integer | 常量 `3` | canonical 形状版本（v3 起为 3；v2 为 2、v1 为 1）。新增必需字段即视为形状变更，必须升号 |
+| `version` | integer | 常量 `4` | canonical 形状版本（v4 起为 4；v3 为 3、v2 为 2、v1 为 1）。新增必需字段即视为形状变更，必须升号 |
 | `generatedAt` | string | ISO-8601 UTC（`2026-10-07T02:41:07.512Z`） | 生成时刻 |
 | `unit` | string | 常量 `"token"` | 所有 token 数值的单位；便于模型理解量纲 |
 | `estimator` | string | 常量 `"heuristic-v1"` | token 估算器标识：`ceil(ascii/4 + nonAscii/1.5)`；仅用于相对比较与排序 |
@@ -91,10 +112,13 @@ v2 追加一层**归属与候选**：`items[].providedBy` 回答"这个工具由
 | `sessionsRoot` | string | 绝对路径，如 `/home/u/.dsh/sessions`（诊断用，仅路径） |
 | `sessionsAvailable` | integer | 该 `workspaceKey` 下的会话目录总数 |
 | `sessionsScanned` | integer | 实际成功读取并回放的会话数 |
-| `sessionsUnreadable` | integer | 选中但读取/解压失败的会话数 |
+| `sessionsUnreadable` | integer | **选中**但读取/解压失败的会话数 |
 | `sessionsLimit` | integer | 本次扫描上限（工具参数，默认 20，范围 1..200） |
-| `windowStart` | string \| null | 被扫描会话中最早日志的 mtime（ISO-8601 UTC）；无则为 null |
-| `windowEnd` | string \| null | 最晚日志的 mtime（ISO-8601 UTC）；无则为 null |
+| `sessionsOutsideWindow` | integer ≥ 0 | **v4 新增**：**未进入本次窗口**的会话数 = `sessionsAvailable − sessionsScanned − sessionsUnreadable`（§2.2 的 W4）。> 0 时**所有**"零调用"结论都是**窗口内**结论（§2.26） |
+| `windowStart` | string \| null | 被**成功回放**的会话中，日志文件 `mtime` 最早者（ISO-8601 UTC）；`null` 仅当 `sessionsScanned === 0`（下详） |
+| `windowEnd` | string \| null | 同上，日志文件 `mtime` 最晚者（ISO-8601 UTC）；`null` 仅当 `sessionsScanned === 0` |
+| `windowBasis` | string | **v4 新增**：常量 `"session-log-mtime"`——**窗口边界的证据来源**：被成功回放的会话**日志文件的 mtime**（文件系统元数据）。**禁止**把它读成"日志内的时间戳"：行内 `time` 字段属未授权读取面（§3.1、§3.8） |
+| `currentSession` | object | **v4 新增**：本次对账所属会话的身份与窗口覆盖状态（§2.26.2）；子字段全部必需 |
 | `linesRead` | integer | 实际检视的 JSONL 行数（含被丢弃的行） |
 | `toolCalls` | integer | 判定为 `tool/call` 的行数；恒等于 `Σ items[].calls(非空) + callsUnmatched + namesRejected`（= 观测到的一切工具调用） |
 | `skillToolCalls` | integer | 其中 `data.name === "skill"` 的次数（技能机制级使用量） |
@@ -116,6 +140,39 @@ v2 追加一层**归属与候选**：`items[].providedBy` 回答"这个工具由
 
 > 名称说明：`scope.truncated` 是"会话日志回放被截断"，`scope.providerScan.capped` 是"源码扫描触达上限"，
 > 两者语义不同，不得互相借用（v2 特意不叫 `truncated` 以避免误读）。
+
+**窗口边界与窗口口径（v4 冻结；这是本版最容易被读错的一处，逐条读）**
+
+1. **窗口 = 该 `workspaceKey` 下按日志 `mtime` 降序取的前 `sessionsLimit` 个会话目录**（`sessionsLimit` 即既有的 `sessions` 参数，默认 20，范围 1..200）。
+2. **`calls` 计数只在这个窗口内闭合**：`calls`、`categories[].calls`、`totals.observedCalls`、`scope.toolCalls` 全都是**窗口内**的数字。它们**不是**"磁盘上所有会话"的数字，也**不得**被表述成"从未使用过"（§2.26.5）。
+3. **不做穷尽磁盘**：探测窗口外的调用需要读窗口外的日志，次数无上界（§6 第 12 条）。窗口外的信息只有 `sessionsOutsideWindow` 这一个**数量**；要覆盖更多会话就把 `sessions` 调大（上限 200）。
+4. **窗口边界只能用文件系统元数据表达**：`windowStart`/`windowEnd` 取被成功回放会话的日志文件 `mtime` 的最小/最大值（`windowBasis = "session-log-mtime"`）。**禁止**改读日志行内的时间戳来"更精确地"表达边界——那是新增读取通道（§3.8、§10.2 E2）。
+5. `mtime` 的语义是"该日志文件最后一次被写入的时刻"，**不是**会话开始/结束时刻。它只用来**划定窗口**与**向用户交代窗口**，不参与任何计数、不参与排序、不参与任何差值计算。
+
+**窗口不变量（冻结；验证线可直接断言）**：
+
+| # | 不变量 |
+|---|---|
+| W1 | `sessionsScanned ≥ 1` ⟹ `windowStart !== null ∧ windowEnd !== null`（**不再恒为 null**） |
+| W2 | `windowStart !== null` ⟹ `windowStart ≤ windowEnd`（ISO-8601 UTC 下字符串比较与时间序一致） |
+| W3 | `sessionsScanned === 0` ⟹ `windowStart === null ∧ windowEnd === null`（降级态：没有窗口，也就没有窗口边界） |
+| W4 | `sessionsAvailable = sessionsScanned + sessionsUnreadable + sessionsOutsideWindow` |
+| W5 | `sessionsScanned + sessionsUnreadable ≤ sessionsLimit`（被选中的会话至多 `sessionsLimit` 个） |
+| W6 | `windowBasis === "session-log-mtime"`（常量；不得出现其他取值） |
+
+**`scope.currentSession`（v4 新增，全部必需）**：
+
+| 子字段 | 类型 | 语义 |
+|---|---|---|
+| `id` | string \| null | 本次对账所属会话的标识。**只允许来自运行时对象**：模型工具半区取 `agent.session.id`（§1 已核验）；面板路由半区取 `?session=` 的值（或由它解析出的 agent 的 `agent.session.id`）。取不到时为 `null` |
+| `basis` | string | `id` 的来源：`"agent-session-id"` \| `"http-session-param"` \| `"unavailable"`。硬规则：`basis === "unavailable"` ⟺ `id === null` |
+| `inWindow` | boolean | `id !== null` **且**该会话的日志在本次窗口中被**成功回放**（即计入 `sessionsScanned`）时为 `true`；否则 `false`（含 `id === null` 的情形） |
+
+**硬规则（`currentSession`）**：
+1. **不得猜**：`id` **不许**用"mtime 最新的那个会话"顶替。若运行时对象取不到 id，就如实报 `null` + `"unavailable"`——用推断值会让"本会话调用数"变成假事实。
+2. **不得用 0 表示"没查到"**：`inWindow === false` 时逐项 `currentSessionCalls` 恒为 `null`（§2.26.2 判定表），**绝不为 0**。
+3. `id` 必须先过 `NAME_PATTERN`（§3.3）：不匹配时按"取不到"处理（`null` + `"unavailable"`），并把该情形计入 `scope.namesRejected` 的告警语义（§3.8）。这条是隐私防线（防止任意宿主字符串进入产物），不是可选项。
+4. `inWindow` 与"本会话调用计数通道是否可用"**恒等价**（§2.26.4 的 I4）：`inWindow === true` ⟺ 宿主提供了本会话计数通道（`currentSessionCallsByName !== null`）。两者不得分歧。
 
 ### 2.3 `categories[]`（四类注入物，顺序固定）
 
@@ -142,6 +199,13 @@ v2 追加一层**归属与候选**：`items[].providedBy` 回答"这个工具由
 这与"不产生假零调用"同源。若未来要保留"39/40 已知"这类信息，必须新增独立的
 "部分可观测"状态（BACKLOG R4），**不得**通过放宽本条的 `null` 语义来实现。
 
+**v4 说明（`categories[]` 本版一字未改，且不得自行扩张）**：`calls` / `tokensPerCall` / `mechanismCalls`
+的口径与 `null` 规则**全部保持 v3 原样**；v4 新增的三个维度（`currentSessionCalls` / `sessionsWithCalls` /
+`callPresence`）**只存在于 `items[]`**，**不**上提到 `categories[]`——类级三态会立刻撞上本节的
+"部分可观测即 `null`"规则（一个类里只要有一个 `calls === null` 的项，整类就不可求和），
+收益为零而歧义成倍。面板也**不得**为此自造类级派生数字（§5 的唯一派生量仍只有占比条）：
+要在分类层看到三态，只能把该类各项的 `callPresence` **逐个**列出来（不合并、不相加）。
+
 ### 2.4 `items[]`（逐项账目 —— 四要素的载体）
 
 | 字段 | 类型 | 单位 | 必需 | 语义 |
@@ -152,7 +216,10 @@ v2 追加一层**归属与候选**：`items[].providedBy` 回答"这个工具由
 | `tokens` | integer ≥ 0 | token | ✅ | **成本**：该注入物每请求常驻的 token 估算 |
 | `calls` | integer ≥ 0 \| null | 次 | ✅ | **调用次数**：`null` = 不可观测 / 无证据 |
 | `tokensPerCall` | integer ≥ 0 \| null | token/次 | ✅ | **每次使用成本** = `round(tokens / calls)`；`calls` 为 null 或 0 时 null |
-| `zeroCall` | boolean \| null | — | ✅ | **是否零调用**：仅当 `usageBasis === "tool-calls"` 时有布尔值（`calls === 0` → true）；否则 null |
+| `zeroCall` | boolean \| null | — | ✅ | **是否零调用**：仅当 `usageBasis === "tool-calls"` 时有布尔值（`calls === 0` → true）；否则 null。**v4 语义一字未改**（仍是"窗口内零调用"） |
+| `currentSessionCalls` | integer ≥ 0 \| null | 次 | ✅ | **v4 新增**：**本会话调用数**（`scope.currentSession.id` 那个会话内的 `tool/call` 次数）。`null` = 给不出（不可观测 / 无证据 / **本会话不在窗口内**）。**绝不用 0 表示"没查到"** |
+| `sessionsWithCalls` | integer ≥ 0 \| null | 个 | ✅ | **v4 新增**：**覆盖会话数**——窗口内**调用过**该工具的会话数（分母 = `scope.sessionsScanned`）。`null` = 该维度不可用（不可观测 / 无证据 / 宿主未提供覆盖通道）；**绝不按 `calls` 反推**（`calls = 15` 可能是 1 个会话，也可能是 15 个） |
+| `callPresence` | string \| null | — | ✅ | **v4 新增**：**三态判定**（本版的要点）：`"current-session"`（本会话调用过）/ `"historical-only"`（本会话没调用过，但窗口内其他会话调用过）/ `"absent"`（窗口内从未调用）。`null` = 判定不了（不可观测 / 无证据 / 本会话不可判定）。取值域**恰好 3 个 + null**，判定表见 §2.26.2 |
 | `usageBasis` | string | — | ✅ | 次数来源与可信度，见下表 |
 | `source` | string | — | 可选 | `instructions`: `"project" \| "user"`；`skills`: 注册来源（如 `user-dsh`/`bundled`）；`tools`: 恒 `"native"`；`mcp`: 恒 `"mcp"` |
 | `server` | string | — | 可选 | 仅 `mcp`：`mcp__<server>__<tool>` 解析出的 `<server>` |
@@ -176,6 +243,16 @@ v2 追加一层**归属与候选**：`items[].providedBy` 回答"这个工具由
 3. 其余（`tools`/`mcp`）：`name` 不匹配 `NAME_PATTERN` → `unobservable`（并计入 `scope.namesRejected`）；
    否则 `scope.usageAvailable === false` → `no-evidence`；否则 `tool-calls`，`calls = 命中次数`（可为 0）。
 
+**v4 三个新字段的赋值规则（与上面同一次判定、不得另立第二套）**：
+
+| 情形 | `currentSessionCalls` | `sessionsWithCalls` | `callPresence` |
+|---|---|---|---|
+| `calls === null`（`always-on` / `unobservable` / `no-evidence`） | `null` | `null` | `null` |
+| `usageBasis === "tool-calls"` ∧ `scope.currentSession.inWindow === true` ∧ 覆盖通道可用 | `currentSessionCallsByName[name] ?? 0`（∈ 0..`calls`） | `sessionCoverage[name] ?? 0`（∈ 0..`sessionsScanned`） | 按 §2.26.2 判定表 |
+| `usageBasis === "tool-calls"` ∧ （本会话不在窗口内 ∨ 覆盖通道缺失） | `null` | 覆盖通道有则给，无则 `null` | `null` |
+
+硬规则：`null` 与 `0` 是**两个**事实，不得互相替代（§2.26.4 的 I1–I3）；三个新字段**不得**由 `calls` 反推得出。
+
 ### 2.5 `findings`（结论清单，直接供面板与模型消费）
 
 | 字段 | 上限 | 排序 | 记录字段（字段名与 `items` 完全一致，不得改名） |
@@ -193,10 +270,17 @@ v2 追加一层**归属与候选**：`items[].providedBy` 回答"这个工具由
 | `hidePlanStatus` | — | — | **v3 新增**：`"prechecked" \| "unvalidated" \| "unsupported"`（三者取最弱一环），见 §2.20 |
 | `hideApply` | — | — | **v3 新增**：`{ mode, interfacePresent, denyList, skipped, applySupported, appliedNames }`，见 §2.18/§2.23.4 |
 | `hidePlanCaveat` | — | — | **v3 新增**：共享代价常量（5 键），必须在工具输出 / native 渲染 / 面板三处同时呈现，见 §2.19 |
+| `zeroCallBasis` | — | — | **v4 新增**：常量 `"model-tool-calls-in-window"`——**窗口边界声明**：`findings.zeroCall`（以及同源的 `prunePlan` / `hidePlan`）里的"从未调用"只在**扫描窗口内**成立，必须连同窗口一起读（§2.26.5）。它与 `prunePlanBasis`/`hidePlanBasis`（`"model-tool-calls-only"` = **证据种类**）**正交**：一个是"依据什么证据"，一个是"证据覆盖到哪" |
 
 `findings.zeroCall` **只**含 `zeroCall === true` 的项；`calls === null` 的项永远不进这两个清单中的 `zeroCall`。
 当 `scope.usageAvailable === false` 时，`findings.zeroCall` 恒为 `[]`，且 `prunePlan` 恒为 `[]`
 （**没有证据就没有候选**——不得用旧数据或推测填补）。
+
+**`findings.zeroCall` 的口径（v4 明确，语义未改）**：它是**窗口内**零调用，不是"磁盘上从未调用"。
+消费方（native 渲染 / 面板 / 模型）**必须**把它与 `scope` 的窗口字段一起呈现（`sessionsScanned` /
+`sessionsAvailable` / `sessionsOutsideWindow` / `windowStart→windowEnd`），否则会把"最近没用"读成"从来没用"
+——这正是 v4 要消除的那个真实误读。`findings.zeroCall` 的记录字段（`{ id, category, name, tokens }`）**不改**；
+三态信息在 `items[]` 里（面板按 `id` 对齐，属展示映射，不是重算）。
 
 ### 2.6 `totals`（合计与自洽计数）
 
@@ -206,6 +290,7 @@ v2 追加一层**归属与候选**：`items[].providedBy` 回答"这个工具由
 | `observableTokens` | integer | Σ `tokens`（`calls !== null` 的项） |
 | `unknownUsageTokens` | integer | Σ `tokens`（`calls === null` 的项） |
 | `observedCalls` | integer | Σ `calls`（非 null 项） |
+| `currentSessionObservedCalls` | integer \| null | **v4 新增**：Σ `currentSessionCalls`（非 null 项）。**没有任何非 null 的 `currentSessionCalls` 时恒为 `null`**（不是 0——"给不出"与"确实是 0"必须可区分）。恒有 `currentSessionObservedCalls ≤ observedCalls`（两者都非 null 时） |
 | `observableTokensPerCall` | integer \| null | `observedCalls > 0` 时 `round(observableTokens / observedCalls)`，否则 null |
 | `zeroCallItems` | integer | `zeroCall === true` 的项数（⊂ observable 项） |
 | `zeroCallTokens` | integer | `zeroCall === true` 的项 token 合计 |
@@ -246,10 +331,14 @@ v2 追加一层**归属与候选**：`items[].providedBy` 回答"这个工具由
 
 ### 2.9 完整示例 JSON（**合成数据**，用于展示形状与取值约束；非本机实测值；本机实测的扫描足迹见 §2.14）
 
+> **v4 提示**：本节示例已随 v4 形状更新（`version: 4` + 三态字段 + 窗口字段）。
+> 其中与"三态调用口径"相关的小节（`scope.currentSession`、逐项三态、`findings.zeroCallBasis`）另在 **§2.26.3** 给出
+> **增量片段**（同源数字、标注为合成），两处的重叠字段**必须逐字相同**（§2.26.3 的关系说明）。
+
 ```jsonc
 {
   "tool": "context_ledger",
-  "version": 3,
+  "version": 4,
   "generatedAt": "2026-10-07T02:41:07.512Z",
   "unit": "token",
   "estimator": "heuristic-v1",
@@ -259,10 +348,14 @@ v2 追加一层**归属与候选**：`items[].providedBy` 回答"这个工具由
     "sessionsRoot": "/home/u/.dsh/sessions",
     "sessionsAvailable": 41,
     "sessionsScanned": 20,
-    "sessionsUnreadable": 1,
+    "sessionsUnreadable": 0,
     "sessionsLimit": 20,
+    "sessionsOutsideWindow": 21,
     "windowStart": "2026-09-30T00:12:44.001Z",
     "windowEnd": "2026-10-07T02:38:19.774Z",
+    "windowBasis": "session-log-mtime",
+    "currentSession": { "id": "1f0a2b3c-4d5e-6f70-8192-a3b4c5d6e7f8", "basis": "agent-session-id",
+      "inWindow": true },
     "linesRead": 41233,
     "toolCalls": 141,
     "skillToolCalls": 9,
@@ -285,37 +378,44 @@ v2 追加一层**归属与候选**：`items[].providedBy` 回答"这个工具由
   ],
   "items": [
     { "id": "mcp:mcp__openviking__add_resource", "category": "mcp", "name": "mcp__openviking__add_resource",
-      "tokens": 402, "calls": 0, "tokensPerCall": null, "zeroCall": true, "usageBasis": "tool-calls",
+      "tokens": 402, "calls": 0, "tokensPerCall": null, "zeroCall": true,
+      "currentSessionCalls": 0, "sessionsWithCalls": 0, "callPresence": "absent", "usageBasis": "tool-calls",
       "source": "mcp", "server": "openviking", "bytes": 1609,
       "providedBy": { "kind": "mcp-server", "name": "openviking", "confidence": "high",
         "method": "mcp-naming", "evidenceFile": null, "candidates": [] } },
     { "id": "tools:subagent", "category": "tools", "name": "subagent", "tokens": 402, "calls": 0,
-      "tokensPerCall": null, "zeroCall": true, "usageBasis": "tool-calls", "source": "native", "bytes": 1608,
+      "tokensPerCall": null, "zeroCall": true,
+      "currentSessionCalls": 0, "sessionsWithCalls": 0, "callPresence": "absent",
+      "usageBasis": "tool-calls", "source": "native", "bytes": 1608,
       "providedBy": { "kind": "unknown", "name": null, "confidence": "low", "method": "static-scan-weak",
         "evidenceFile": null,
         "candidates": ["@linxin666/dsh-pet", "@linxin666/dsh-session-archive", "@linxin666/dsh-web-all",
           "@nanmicoder/dsh-agent-teams", "@openviking/dsh-memory-plugin", "dsh-context", "dshmarket"] } },
     { "id": "mcp:mcp__openviking__forget", "category": "mcp", "name": "mcp__openviking__forget", "tokens": 341,
-      "calls": 0, "tokensPerCall": null, "zeroCall": true, "usageBasis": "tool-calls",
+      "calls": 0, "tokensPerCall": null, "zeroCall": true,
+      "currentSessionCalls": 0, "sessionsWithCalls": 0, "callPresence": "absent", "usageBasis": "tool-calls",
       "source": "mcp", "server": "openviking", "bytes": 1364,
       "providedBy": { "kind": "mcp-server", "name": "openviking", "confidence": "high",
         "method": "mcp-naming", "evidenceFile": null, "candidates": [] } },
     { "id": "tools:task_board_list", "category": "tools", "name": "task_board_list", "tokens": 292,
-      "calls": 0, "tokensPerCall": null, "zeroCall": true, "usageBasis": "tool-calls",
+      "calls": 0, "tokensPerCall": null, "zeroCall": true,
+      "currentSessionCalls": 0, "sessionsWithCalls": 0, "callPresence": "absent", "usageBasis": "tool-calls",
       "source": "native", "bytes": 1168,
       "providedBy": { "kind": "plugin", "name": "@linxin666/dsh-client-ui-task-board", "confidence": "high",
         "method": "static-scan",
         "evidenceFile": "/home/u/.dsh/profiles/web/node_modules/@linxin666/dsh-client-ui-task-board/lib/index.js",
         "candidates": [] } },
     { "id": "tools:task_board_github_list", "category": "tools", "name": "task_board_github_list", "tokens": 196,
-      "calls": 0, "tokensPerCall": null, "zeroCall": true, "usageBasis": "tool-calls",
+      "calls": 0, "tokensPerCall": null, "zeroCall": true,
+      "currentSessionCalls": 0, "sessionsWithCalls": 0, "callPresence": "absent", "usageBasis": "tool-calls",
       "source": "native", "bytes": 784,
       "providedBy": { "kind": "plugin", "name": "@linxin666/dsh-client-ui-task-board-github",
         "confidence": "high", "method": "static-scan",
         "evidenceFile": "/home/u/.dsh/profiles/web/node_modules/@linxin666/dsh-client-ui-task-board-github/lib/index.js",
         "candidates": [] } },
     { "id": "tools:task_board_schedule", "category": "tools", "name": "task_board_schedule", "tokens": 174,
-      "calls": 0, "tokensPerCall": null, "zeroCall": true, "usageBasis": "tool-calls",
+      "calls": 0, "tokensPerCall": null, "zeroCall": true,
+      "currentSessionCalls": 0, "sessionsWithCalls": 0, "callPresence": "absent", "usageBasis": "tool-calls",
       "source": "native", "bytes": 696,
       "providedBy": { "kind": "plugin", "name": "@linxin666/dsh-client-ui-task-board", "confidence": "high",
         "method": "static-scan",
@@ -323,49 +423,69 @@ v2 追加一层**归属与候选**：`items[].providedBy` 回答"这个工具由
         "candidates": [] } },
 
     { "id": "tools:context_ledger", "category": "tools", "name": "context_ledger", "tokens": 214,
-      "calls": 3, "tokensPerCall": 71, "zeroCall": false, "usageBasis": "tool-calls",
+      "calls": 3, "tokensPerCall": 71, "zeroCall": false,
+      "currentSessionCalls": 2, "sessionsWithCalls": 2, "callPresence": "current-session",
+      "usageBasis": "tool-calls",
       "source": "native", "bytes": 856,
       "providedBy": { "kind": "plugin", "name": "dsh-context-ledger", "confidence": "low",
         "method": "static-scan-weak",
         "evidenceFile": "/home/u/Desktop/DSHWorkspace/dsh-context-ledger/index.js", "candidates": [] } },
     { "id": "tools:agent_teams_claim_task", "category": "tools", "name": "agent_teams_claim_task", "tokens": 268,
-      "calls": 4, "tokensPerCall": 67, "zeroCall": false, "usageBasis": "tool-calls",
+      "calls": 4, "tokensPerCall": 67, "zeroCall": false,
+      "currentSessionCalls": 0, "sessionsWithCalls": 2, "callPresence": "historical-only",
+      "usageBasis": "tool-calls",
       "source": "native", "bytes": 1072,
       "providedBy": { "kind": "plugin", "name": "@nanmicoder/dsh-agent-teams", "confidence": "high",
         "method": "static-scan",
         "evidenceFile": "/home/u/.dsh/profiles/web/node_modules/@nanmicoder/dsh-agent-teams/lib/tool-names.js",
         "candidates": [] } },
     { "id": "mcp:mcp__openviking__find", "category": "mcp", "name": "mcp__openviking__find", "tokens": 406,
-      "calls": 8, "tokensPerCall": 51, "zeroCall": false, "usageBasis": "tool-calls",
+      "calls": 8, "tokensPerCall": 51, "zeroCall": false,
+      "currentSessionCalls": 3, "sessionsWithCalls": 5, "callPresence": "current-session",
+      "usageBasis": "tool-calls",
       "source": "mcp", "server": "openviking", "bytes": 1624,
       "providedBy": { "kind": "mcp-server", "name": "openviking", "confidence": "high",
         "method": "mcp-naming", "evidenceFile": null, "candidates": [] } },
     { "id": "tools:read", "category": "tools", "name": "read", "tokens": 186, "calls": 4,
-      "tokensPerCall": 47, "zeroCall": false, "usageBasis": "tool-calls", "source": "native", "bytes": 744,
+      "tokensPerCall": 47, "zeroCall": false,
+      "currentSessionCalls": 1, "sessionsWithCalls": 3, "callPresence": "current-session",
+      "usageBasis": "tool-calls", "source": "native", "bytes": 744,
       "providedBy": { "kind": "core", "name": null, "confidence": "high", "method": "static-scan",
         "evidenceFile": "/opt/dsh/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-api-workspace-files/lib/index.js",
         "candidates": [] } },
     { "id": "tools:bash", "category": "tools", "name": "bash", "tokens": 381, "calls": 118,
-      "tokensPerCall": 3, "zeroCall": false, "usageBasis": "tool-calls", "source": "native", "bytes": 1524,
+      "tokensPerCall": 3, "zeroCall": false,
+      "currentSessionCalls": 41, "sessionsWithCalls": 12, "callPresence": "current-session",
+      "usageBasis": "tool-calls", "source": "native", "bytes": 1524,
       "providedBy": { "kind": "core", "name": null, "confidence": "high", "method": "static-scan",
         "evidenceFile": "/opt/dsh/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-tool-bash/lib/index.js",
         "candidates": [] } },
 
     { "id": "instructions:/home/u/Desktop/DSHWorkspace/AGENTS.md", "category": "instructions",
       "name": "/home/u/Desktop/DSHWorkspace/AGENTS.md", "tokens": 812, "calls": null,
-      "tokensPerCall": null, "zeroCall": null, "usageBasis": "always-on", "source": "project",
+      "tokensPerCall": null, "zeroCall": null,
+      "currentSessionCalls": null, "sessionsWithCalls": null, "callPresence": null,
+      "usageBasis": "always-on", "source": "project",
       "bytes": 3421, "loadOrder": 1 },
     { "id": "skills:genui", "category": "skills", "name": "genui", "tokens": 128, "calls": null,
-      "tokensPerCall": null, "zeroCall": null, "usageBasis": "unobservable",
+      "tokensPerCall": null, "zeroCall": null,
+      "currentSessionCalls": null, "sessionsWithCalls": null, "callPresence": null,
+      "usageBasis": "unobservable",
       "source": "user-dsh", "provider": "filesystem", "bytes": 512 },
     { "id": "skills:openviking-memory", "category": "skills", "name": "openviking-memory", "tokens": 96,
-      "calls": null, "tokensPerCall": null, "zeroCall": null, "usageBasis": "unobservable",
+      "calls": null, "tokensPerCall": null, "zeroCall": null,
+      "currentSessionCalls": null, "sessionsWithCalls": null, "callPresence": null,
+      "usageBasis": "unobservable",
       "source": "user-dsh", "provider": "filesystem", "bytes": 384 },
     { "id": "skills:openviking-skills", "category": "skills", "name": "openviking-skills", "tokens": 88,
-      "calls": null, "tokensPerCall": null, "zeroCall": null, "usageBasis": "unobservable",
+      "calls": null, "tokensPerCall": null, "zeroCall": null,
+      "currentSessionCalls": null, "sessionsWithCalls": null, "callPresence": null,
+      "usageBasis": "unobservable",
       "source": "user-dsh", "provider": "filesystem", "bytes": 352 },
     { "id": "skills:ov-experience-memory", "category": "skills", "name": "ov-experience-memory", "tokens": 74,
-      "calls": null, "tokensPerCall": null, "zeroCall": null, "usageBasis": "unobservable",
+      "calls": null, "tokensPerCall": null, "zeroCall": null,
+      "currentSessionCalls": null, "sessionsWithCalls": null, "callPresence": null,
+      "usageBasis": "unobservable",
       "source": "user-dsh", "provider": "filesystem", "bytes": 296 }
   ],
   "findings": {
@@ -414,6 +534,7 @@ v2 追加一层**归属与候选**：`items[].providedBy` 回答"这个工具由
     ],
     "prunePlanReclaimableTokens": 1405,
     "prunePlanBasis": "model-tool-calls-only",
+    "zeroCallBasis": "model-tool-calls-in-window",
     "noRecommendation": [
       { "reason": "core", "items": 0, "tokens": 0 },
       { "reason": "no-owner-bundle", "items": 0, "tokens": 0 },
@@ -425,6 +546,7 @@ v2 追加一层**归属与候选**：`items[].providedBy` 回答"这个工具由
     "observableTokens": 3262,
     "unknownUsageTokens": 1198,
     "observedCalls": 137,
+    "currentSessionObservedCalls": 47,
     "observableTokensPerCall": 24,
     "zeroCallItems": 6,
     "zeroCallTokens": 1807,
@@ -459,16 +581,29 @@ v2 追加一层**归属与候选**：`items[].providedBy` 回答"这个工具由
 | `providedBy.name` 与 `kind` 的组合约束 | `plugin` → 非 null 且匹配 `PACKAGE_PATTERN`；`mcp-server` → 非 null 且匹配 `MCP_NAME_PATTERN` 的 server 段；`core`/`unknown` → null |
 | `items` 顺序 | 严格符合 §2.7：rank0（402,402 → 341 → 292 → 196 → 174）→ rank1（71.33 → 67 → 50.75 → 46.5 → 3.23）→ rank2（812 → 128 → 96 → 88 → 74） |
 | `findings.zeroCall` / `topPerUse` 顺序 | 分别符合 §2.5 的 tokens 降序 / 未取整比值降序（`zeroCall` 中 `402` 并列时按 `id` 升序：`mcp:…` < `tools:…`） |
+| **（v4）`sessionsAvailable = sessionsScanned + sessionsUnreadable + sessionsOutsideWindow`**（§2.2 W4） | `41 = 20 + 0 + 21` |
+| **（v4）`sessionsScanned + sessionsUnreadable ≤ sessionsLimit`**（W5） | `20 + 0 ≤ 20` |
+| **（v4）`sessionsScanned ≥ 1` ⟹ `windowStart`、`windowEnd` 均非 null**（W1） | 两者均为 ISO-8601 UTC 字符串 |
+| **（v4）`windowBasis === "session-log-mtime"`**（W6） | 成立 |
+| **（v4）`totals.currentSessionObservedCalls = Σ items[].currentSessionCalls(非 null)`** | `47 = 41 + 3 + 2 + 0 + 1` |
+| **（v4）`totals.currentSessionObservedCalls ≤ totals.observedCalls`** | `47 ≤ 137` |
+| **（v4）三态齐全，且 `zeroCall === true` ⟺ `callPresence === "absent"`** | `current-session` 4 项 / `historical-only` 1 项（`agent_teams_claim_task`）/ `absent` 6 项（= `zeroCall === true` 的项数 6） |
+| **（v4）`calls === null` ⟹ 三个新字段全为 `null`** | `5` 项（1 instructions + 4 skills） |
+| **（v4）逐项 `currentSessionCalls ≤ calls`、`sessionsWithCalls ≤ sessionsScanned`** | `41≤118`、`3≤8`、`2≤3`、`1≤4`、`0≤4`；最大覆盖 `12 ≤ 20` |
+| **（v4）`calls > 0` ⟹ `sessionsWithCalls ≥ 1`；`calls === 0` ⟹ `sessionsWithCalls === 0`** | 成立（无"有调用却零覆盖"的矛盾项） |
+| **（v4）`scope.currentSession.id` 匹配 `NAME_PATTERN`** | 成立（`1f0a2b3c-4d5e-6f70-8192-a3b4c5d6e7f8`） |
+| **（v4）`findings.zeroCallBasis === "model-tool-calls-in-window"`** | 成立 |
+| **（v4）`scope.currentSession.inWindow === true` ⟺ 存在 `currentSessionCalls !== null` 的项**（§2.26.4 I4） | 成立（均为 true / 均存在） |
 
 ### 2.10 工具签名（模型半区，冻结）
 
 ```
 name: "context_ledger"
 parameters: { sessions?: integer }        // 1..200，缺省 20；越界夹取（v2 不新增任何参数）
-output.schema: 对象，字段 = §2.1 全部必需字段（v2 含 providedBy / providerScan / prunePlan 系列），additionalProperties: false
+output.schema: 对象，字段 = §2.1 全部必需字段（v2 含 providedBy / providerScan / prunePlan 系列；v4 含 currentSessionCalls / sessionsWithCalls / callPresence / currentSession / windowBasis / sessionsOutsideWindow / zeroCallBasis / currentSessionObservedCalls），additionalProperties: false
 ```
 
-`description`（**英文**，模型可读；**v2 修订**：加入归属与"候选而非建议"的措辞，实现线照抄）：
+`description`（**英文**，模型可读；**v4 修订**：补一句窗口口径限定——见下；实现线照抄）：
 
 > Reconcile the resident cost of every injected context item against how often it is actually
 > called in this workspace's session logs. Reports, per item: token cost, call count,
@@ -477,8 +612,15 @@ output.schema: 对象，字段 = §2.1 全部必需字段（v2 含 providedBy / 
 > fact — and groups never-called items by the plugin bundle or MCP server they come from.
 > Those groups are CANDIDATES for review, not uninstall advice: a tool can still be used by the
 > UI, by background flows, or rarely but crucially, and model call counts cannot prove otherwise.
+> **Call counts cover only the scanned window** (the most recent sessions, `sessions` parameter,
+> default 20) — the report states the window bounds and how many sessions were left outside it,
+> so "0 calls" means "not called in this window", never "never used".
 > Read-only: it never writes a file, never reads message content, and extracts only tool names
 > and counts from session logs.
+
+**v4 修订句的理由**：模型半区是"零调用候选"这句话的**发出者**。若不告诉它窗口口径，它会继续把
+"窗口内 0 次"表述成"从未使用"（这正是本版要消除的真实误读，§2.26 开头）。该句只陈述事实，
+不含建议性措辞，与 §6 第 10 条一致。
 
 ### 2.11 native 渲染（文本块，冻结格式）
 
@@ -503,6 +645,13 @@ Never-called candidates, grouped by removal unit — NOT uninstall advice: 1405 
   - plugin @linxin666/dsh-web-all: 3 tools, 662 tokens if unused  (provides @linxin666/dsh-client-ui-task-board, @linxin666/dsh-client-ui-task-board-github)
 No actionable unit: 1 item, 402 tokens (unknown attribution 1)
 A tool can still be used by the UI, by background flows, or rarely but crucially; verify before removing.
+Hide candidates (tool level) — needs manual confirmation: <hidePlanTokens> tokens in <N> tools across <U> units (status: <hidePlanStatus>)
+  - <kind> <target|(no uninstall unit)>: hide <toolCount> tools, <tokens> tokens if hidden  |  uninstall this unit: <reclaimableTokens> tokens if unused (<usedToolCount> tools of this unit in use)
+  - <kind> (no uninstall unit): hide <toolCount> tool, <tokens> tokens if hidden  |  uninstall is not available for this unit
+  - (no candidates in this window)                      # 仅当 hidePlan 为空
+Hide caveats: registry-level hide, not schema-only; non-model registry calls: unobservable; service coupling: unconfirmed; manual confirmation required before applying; prompt cache: one-time invalidation
+Hide apply: <mode> (nothing applied by this plugin; opt-in config required | <N> names applied to this agent scope)
+Do not add the hide tokens to the uninstall candidates: the two actions are alternative, not cumulative.
 ```
 
 第 4 段（R1 追加段）**措辞是契约的一部分**：段标题必须含 "candidates" 与 "NOT uninstall advice"；
@@ -510,6 +659,27 @@ A tool can still be used by the UI, by background flows, or rarely but crucially
 末行必须是固定的不确定性声明。**禁止**出现 "uninstall"/"remove"/"delete" 之类确定性动词
 （`if unused` 这类条件措辞是允许且要求的）。中文面板文案对应要求见 §4.7。
 模型可读文本按 §2.11 的英文渲染；面板文案跟随宿主语言（§4.5）。
+
+**第 5 段（R6 追加段）——v4 采信（C2，逐字提升，不得重新措辞）**：
+上一段之后紧接的 7 行是 **v4 从 `IMPLEMENTATION-NOTES.md` 的 F7 记录逐字提升**进本模板的；
+措辞与顺序**一字未改**（它已通过 §6 第 11 条自查），实现线**不得**再改写、重排或"顺手优化"。
+
+| # | 逐字要求 |
+|---|---|
+| 1 | 段标题行必须含 `Hide candidates (tool level)`、`needs manual confirmation` 与 `(status: <hidePlanStatus>)` |
+| 2 | 每个单元一行；两种动作的代价**同屏**（隐藏 vs 卸载），且 `inPrunePlan === false` 的单元只给隐藏从句 `uninstall is not available for this unit` |
+| 3 | `hidePlan` 为空时给出 `  - (no candidates in this window)` 一行（**不是**省略该段） |
+| 4 | `Hide caveats:` 一行必须**逐条**列出 `hidePlanCaveat` 的 5 条（§2.19） |
+| 5 | `Hide apply:` 一行必须区分"本插件什么都没施加"与"已施加 N 个名字"两种形态（§2.23.4） |
+| 6 | 末行必须显式声明两种动作的 token **不得相加**（§2.22 第 3 条） |
+| 7 | 模板里 `  - (no candidates in this window)` 之后的 `# …` 是**文档注解**（说明该行何时出现），不是渲染内容；两个单元行形态是同一条行模板的两种从句分支（见 `lib/reconcile.js` 的 R6 段），实现只需产出**逐行符合**的形式 |
+
+**v4 边界（重要，避免误读为"渲染可以不管窗口"）**：本版的窗口口径在**模型半区**由两处承担——
+①工具描述句（§2.10 的 v4 修订句，**必须逐字照抄**）；②canonical JSON 的 `scope` 窗口字段（模型直接可读）。
+native 渲染的**文本**第 1 行与零调用段标题**本版不改**（理由与确切文案见 §8 的携带项 **C7**）：
+v4 刚把 R6 段**逐字**采信进来，同版再动既有行会让"逐字"这条要求失去判据。
+**但渲染第 1 行的既有文本 `across <sessionsScanned> sessions` 不得被解读为"穷尽磁盘"**——
+它已经带了窗口口径的一半（会话数），另一半（`sessionsAvailable` 与边界）由 JSON 与面板承担。
 
 ### 2.12 降级态示例：日志不可读（`usageAvailable === false`）
 
@@ -519,9 +689,13 @@ A tool can still be used by the UI, by background flows, or rarely but crucially
 
 ```jsonc
 {
-"scope": { "sessionsAvailable": 0, "sessionsScanned": 0, "sessionsUnreadable": 0, "linesRead": 0,
+"scope": { "sessionsAvailable": 0, "sessionsScanned": 0, "sessionsUnreadable": 0,
+           "sessionsLimit": 20, "sessionsOutsideWindow": 0, "linesRead": 0,
            "toolCalls": 0, "skillToolCalls": 0, "callsUnmatched": 0, "callsUnmatchedNames": [],
-           "namesRejected": 0, "usageAvailable": false, "truncated": false, "windowStart": null, "windowEnd": null,
+           "namesRejected": 0, "usageAvailable": false, "truncated": false,
+           "windowStart": null, "windowEnd": null, "windowBasis": "session-log-mtime",
+           "currentSession": { "id": "1f0a2b3c-4d5e-6f70-8192-a3b4c5d6e7f8", "basis": "agent-session-id",
+             "inWindow": false },
            "providerScan": { "packages": 387, "files": 1593, "bytes": 49380329, "capped": true } },
 "categories": [
   { "key": "tools", "itemCount": 8, "tokens": 2113, "calls": null, "tokensPerCall": null,
@@ -529,7 +703,9 @@ A tool can still be used by the UI, by background flows, or rarely but crucially
 ],
 "items": [
   { "id": "tools:task_board_list", "category": "tools", "name": "task_board_list", "tokens": 292,
-    "calls": null, "tokensPerCall": null, "zeroCall": null, "usageBasis": "no-evidence",
+    "calls": null, "tokensPerCall": null, "zeroCall": null,
+    "currentSessionCalls": null, "sessionsWithCalls": null, "callPresence": null,
+    "usageBasis": "no-evidence",
     "source": "native", "bytes": 1168,
     "providedBy": { "kind": "plugin", "name": "@linxin666/dsh-client-ui-task-board", "confidence": "high",
       "method": "static-scan",
@@ -538,11 +714,12 @@ A tool can still be used by the UI, by background flows, or rarely but crucially
 ],
 "findings": { "zeroCall": [], "topPerUse": [], "prunePlan": [],
               "prunePlanReclaimableTokens": 0, "prunePlanBasis": "model-tool-calls-only",
+              "zeroCallBasis": "model-tool-calls-in-window",
               "noRecommendation": [ { "reason": "core", "items": 0, "tokens": 0 },
                                     { "reason": "no-owner-bundle", "items": 0, "tokens": 0 },
                                     { "reason": "unknown-attribution", "items": 0, "tokens": 0 } ] },
 "totals": { "residentTokens": 4460, "observableTokens": 0, "unknownUsageTokens": 4460,
-            "observedCalls": 0, "observableTokensPerCall": null,
+            "observedCalls": 0, "currentSessionObservedCalls": null, "observableTokensPerCall": null,
             "zeroCallItems": 0, "zeroCallTokens": 0, "unknownUsageItems": 16 }
 }
 ```
@@ -551,6 +728,12 @@ A tool can still be used by the UI, by background flows, or rarely but crucially
 （**本轮没有证据**）——两者是不同维度，不得互相覆盖；②`providedBy` 与调用次数**无关**，
 日志不可读时归属照常给出（归属来自安装侧，不来自日志）；③`findings.prunePlan` 恒为 `[]`——
 **没有调用证据就没有候选**（O3 意义上的"合成了矛盾输入"也不得让 `prunePlan` 变得有内容）。
+
+**v4 的降级态补充（三点，同样冻结）**：④`windowStart`/`windowEnd` 为 `null` 且 `windowBasis` 照常给出
+（W3：没有窗口不等于没有窗口口径）；⑤`currentSession.id` **仍然非 null**——会话身份来自运行时对象，
+不依赖日志是否可读；但 `inWindow === false` ⇒ 逐项 `currentSessionCalls` 与 `callPresence` 全为 `null`
+（**绝不因日志读不到就把本会话记成 0 次**）；⑥`totals.currentSessionObservedCalls` 为 `null`（不是 0），
+`findings.zeroCallBasis` 照常给出（它声明口径，不声明证据充足）。
 
 ### 2.13 `items[].providedBy`（R1 冻结：取值域 · 语义 · 置信度）
 
@@ -853,14 +1036,15 @@ DSH 没有暴露可读接口，本插件也不做运行时 hook；因此契约�
 > 本示例是 canonical 报告的 **R6 增量片段**：`findings` 完整 + 全部 24 个零调用 `items`（R6 的候选来源）。
 > `items` 只列与 R6 相关的字段；完整 `items[]` 字段（`providedBy` 等）见 §2.9/§2.13。
 > `findings.prunePlan` 原样带上，用于展示两套动作的配对（§2.22）。
-> **每个数字的出处见 §2.21.2**；`version` 由 2 升 3（新增强制字段即形状变更）。
+> **每个数字的出处见 §2.21.2**；`version` 由 2 升 3（新增强制字段即形状变更）⇒ **v4 起为 4**（本片段的
+> `version` 随 canonical 版本同升；R8 的三态/窗口字段见 §2.26.3，本片段按 R6 范围不重复列）。
 > 真机口径：24 个零调用工具 / 4261 tokens 来自 t6 真机（20 会话、2353 次 `tool/call`）；
 > `openviking` 8 项的逐项 tokens 为真机真值，其余 16 项为**合成载荷**，但**每个单元合计都与真机一致**。
 
 ```jsonc
 {
   "tool": "context_ledger",
-  "version": 3,
+  "version": 4,
   "unit": "token",
   "items": [
     { "id": "mcp:mcp__openviking__add_resource", "category": "mcp", "name": "mcp__openviking__add_resource", "tokens": 891, "calls": 0, "zeroCall": true },
@@ -892,7 +1076,7 @@ DSH 没有暴露可读接口，本插件也不做运行时 hook；因此契约�
     "hidePlan": [
       { "id": "mcp:mcp__openviking__add_resource", "name": "mcp__openviking__add_resource", "category": "mcp", "tokens": 891, "unit": { "kind": "mcp-server", "target": "openviking", "factPackages": [] }, "registryUse": { "verdict": "unconfirmed", "verdictBasis": "no-non-model-observability", "modelCalls": 0, "nameReferencedElsewhere": [], "nonModelCallers": "unobservable" }, "precheck": { "status": "prechecked", "restrictable": true, "reason": null }, "selfTool": false },
       { "id": "mcp:mcp__openviking__add_skill", "name": "mcp__openviking__add_skill", "category": "mcp", "tokens": 464, "unit": { "kind": "mcp-server", "target": "openviking", "factPackages": [] }, "registryUse": { "verdict": "unconfirmed", "verdictBasis": "no-non-model-observability", "modelCalls": 0, "nameReferencedElsewhere": [], "nonModelCallers": "unobservable" }, "precheck": { "status": "prechecked", "restrictable": true, "reason": null }, "selfTool": false },
-      { "id": "tools:subagent", "name": "subagent", "category": "tools", "tokens": 402, "unit": { "kind": "unknown", "target": null, "factPackages": [] }, "registryUse": { "verdict": "unconfirmed", "verdictBasis": "no-non-model-observability", "modelCalls": 0, "nameReferencedElsewhere": ["/home/u/.dsh/profiles/web/node_modules/@nanmicoder/dsh-agent-teams/lib/harness-compat.js", "/home/u/.dsh/profiles/web/node_modules/@linxin666/dsh-session-archive/lib/index.js"], "nonModelCallers": "unobservable" }, "precheck": { "status": "prechecked", "restrictable": true, "reason": null }, "selfTool": false },
+      { "id": "tools:subagent", "name": "subagent", "category": "tools", "tokens": 402, "unit": { "kind": "unknown", "target": null, "factPackages": [] }, "registryUse": { "verdict": "unconfirmed", "verdictBasis": "no-non-model-observability", "modelCalls": 0, "nameReferencedElsewhere": ["/home/u/.dsh/profiles/web/node_modules/@linxin666/dsh-session-archive/lib/index.js", "/home/u/.dsh/profiles/web/node_modules/@nanmicoder/dsh-agent-teams/lib/harness-compat.js"], "nonModelCallers": "unobservable" }, "precheck": { "status": "prechecked", "restrictable": true, "reason": null }, "selfTool": false },
       { "id": "tools:task_board_github_repositories", "name": "task_board_github_repositories", "category": "tools", "tokens": 331, "unit": { "kind": "plugin", "target": "@linxin666/dsh-web-all", "factPackages": ["@linxin666/dsh-client-ui-task-board-github"] }, "registryUse": { "verdict": "unconfirmed", "verdictBasis": "no-non-model-observability", "modelCalls": 0, "nameReferencedElsewhere": [], "nonModelCallers": "unobservable" }, "precheck": { "status": "prechecked", "restrictable": true, "reason": null }, "selfTool": false },
       { "id": "tools:task_board_github_link_pr", "name": "task_board_github_link_pr", "category": "tools", "tokens": 298, "unit": { "kind": "plugin", "target": "@linxin666/dsh-web-all", "factPackages": ["@linxin666/dsh-client-ui-task-board-github"] }, "registryUse": { "verdict": "unconfirmed", "verdictBasis": "no-non-model-observability", "modelCalls": 0, "nameReferencedElsewhere": [], "nonModelCallers": "unobservable" }, "precheck": { "status": "prechecked", "restrictable": true, "reason": null }, "selfTool": false },
       { "id": "tools:task_board_schedule", "name": "task_board_schedule", "category": "tools", "tokens": 274, "unit": { "kind": "plugin", "target": "@linxin666/dsh-web-all", "factPackages": ["@linxin666/dsh-client-ui-task-board"] }, "registryUse": { "verdict": "unconfirmed", "verdictBasis": "no-non-model-observability", "modelCalls": 0, "nameReferencedElsewhere": [], "nonModelCallers": "unobservable" }, "precheck": { "status": "prechecked", "restrictable": true, "reason": null }, "selfTool": false },
@@ -951,6 +1135,7 @@ DSH 没有暴露可读接口，本插件也不做运行时 hook；因此契约�
     ],
     "prunePlanReclaimableTokens": 3376,
     "prunePlanBasis": "model-tool-calls-only",
+    "zeroCallBasis": "model-tool-calls-in-window",
     "noRecommendation": [
       { "reason": "core", "items": 6, "tokens": 483 },
       { "reason": "no-owner-bundle", "items": 0, "tokens": 0 },
@@ -981,8 +1166,9 @@ DSH 没有暴露可读接口，本插件也不做运行时 hook；因此契约�
 | A15 | `hideApply.denyList` 升序且去重 | 成立 |
 | A16 | `hideApply.denyList` = `hidePlan[].name` 升序全集（示例中全部候选都通过预校验） | 成立 |
 | A17 | `items.length === 24 ∧ hidePlan.length === 24` | 成立 |
+| A18 | `hidePlan[].registryUse.nameReferencedElsewhere` 逐项**升序去重**且长度 ≤3（§2.19；实现 = `lib/hide.js` 的 `uniqueSorted(weakEvidence[name]).slice(0, NAME_REFERENCED_LIMIT)`，`NAME_REFERENCED_LIMIT = 3`） | 成立（示例中唯一非空项 `subagent` = `…/@linxin666/dsh-session-archive/lib/index.js` → `…/@nanmicoder/dsh-agent-teams/lib/harness-compat.js`） |
 
-**本示例是机械校验通过版**（A1–A17 全绿）；这 17 条断言是冻结契约的一部分，实现线与验证线都必须逐条通过。
+**本示例是机械校验通过版**（A1–A18 全绿）；这 18 条断言是冻结契约的一部分，实现线与验证线都必须逐条通过。
 
 #### 2.21.2 每个数字的出处（避免把示例当实测）
 
@@ -1145,6 +1331,172 @@ R6 的**主推是 B + A**；C 作为已知选项如实列出（它不是 deny，
 
 ---
 
+### 2.26 R8 契约：三态调用口径与窗口边界显式化（v4 新增）
+
+**触发（真实困惑，不是假想需求）**：用户看到某两个工具在**全部 40 个会话**里被调用过（15 次 / 2 次），
+但在**最近 20 个**里为 0，于是它们被列为"零调用候选"。只看窗口口径的 `calls`，报告**无法回答**
+"到底是没用，还是只是最近没用"。
+
+**本版的答案（三条，都不是穷尽磁盘）**：
+1. **把窗口变成不变量并显式出现在报告里**（§2.2 W1–W6：`windowStart`/`windowEnd`/`windowBasis`/`sessionsOutsideWindow`）；
+2. **把"调用次数"从一个数字拆成三个互不可加的维度**（§2.26.1）；
+3. **给出三态判定**（§2.26.2），让"我此刻在不在用"这一维可见。
+**不**去扫窗口外的日志来回答"窗口外用过没有"——那需要读任意多个会话，次数无上界（§6 第 12 条）。
+窗口外唯一可见的事实就是 `sessionsOutsideWindow` 这个**数量**；要覆盖更多会话，把 `sessions` 调大（上限 200）。
+
+#### 2.26.1 三个维度（命名冻结；与既有 `calls` 并存，不是替代）
+
+| 字段 | 口径（一句话） | 边界 / 分母 | 何时为 `null` |
+|---|---|---|---|
+| `calls`（既有，**未改**） | **窗口总调用**：窗口内全部被成功回放的会话里该工具的 `tool/call` 次数 | 窗口 = `sessionsScanned` 个会话；窗口外**一律不计** | 不可观测 / 无证据（§2.4 赋值优先级） |
+| `currentSessionCalls`（v4 新增） | **本会话调用**：`scope.currentSession.id` 那**一个**会话内的次数 | 该会话是否在窗口内（`inWindow`） | 不可观测 / 无证据 / **本会话不在窗口内** |
+| `sessionsWithCalls`（v4 新增） | **覆盖会话数**：窗口内**调用过**该工具的会话**个数** | 分母恒为 `scope.sessionsScanned` | 不可观测 / 无证据 / 宿主未提供覆盖通道 |
+
+**硬规则（三条，都是"不得混淆"）**：
+1. 三个数**不得**相加、相减、或合并成一个"总调用"数字；面板上也**不得**并列成一个容易相加的"合计"。
+2. `tokensPerCall` **恒按 `calls` 计算**（窗口口径），v4 **不改**；不得改用另两个数做分母。
+3. `sessionsWithCalls` 是**会话个数**，不是次数分布：不得由三者推导"每次会话平均调用几次""哪个会话用得最多"等派生结论（本插件只给事实，不给推断，§6 第 10 条同源）。
+
+#### 2.26.2 三态判定表（冻结；`category ∈ {tools, mcp}`；从上到下第一个命中者胜，互斥且穷尽）
+
+前置读法：`hit` = `currentSessionCallsByName[name] ?? 0`（**仅当**本会话计数通道可用时才有意义，§7.1）。
+
+| # | 条件 | `calls` | `currentSessionCalls` | `sessionsWithCalls` | `callPresence` | `zeroCall` |
+|---|---|---|---|---|---|---|
+| 1 | `usageBasis === "tool-calls"` ∧ `scope.currentSession.inWindow === true` ∧ `hit > 0` | > 0 | `hit` | ≥ 1 | `"current-session"` | false |
+| 2 | `usageBasis === "tool-calls"` ∧ `inWindow === true` ∧ `hit === 0` ∧ `calls > 0` | > 0 | `0` | ≥ 1 | `"historical-only"` | false |
+| 3 | `usageBasis === "tool-calls"` ∧ `inWindow === true` ∧ `calls === 0` | 0 | `0` | `0` | `"absent"` | true |
+| 4 | `usageBasis === "tool-calls"` ∧ `inWindow === false` ∧ `calls > 0` | > 0 | `null` | ≥ 1 | `null` | false |
+| 5 | `usageBasis === "tool-calls"` ∧ `inWindow === false` ∧ `calls === 0` | 0 | `null` | `0` | `null` | true |
+| 6 | `usageBasis ∈ {"always-on", "unobservable"}` | `null` | `null` | `null` | `null` | `null` |
+| 7 | `usageBasis === "no-evidence"` | `null` | `null` | `null` | `null` | `null` |
+
+三态的含义（本版的要点，逐条不可混读）：
+
+| `callPresence` | 人类读法 | **不得**读成 |
+|---|---|---|
+| `"current-session"` | 本会话调用过（正在用） | "很重要"（次数只证明发生过，不证明价值） |
+| `"historical-only"` | 本会话没调用过，窗口内**其他会话**调用过 | "零调用"/"没用"/"该删" —— 它**不进** `findings.zeroCall` |
+| `"absent"` | 窗口内从未调用（含本会话） | "从来没用过"（窗口外未观测，§2.26.5 第 1 条） |
+| `null` | 判定不了（不可观测 / 无证据 / 本会话未覆盖） | `0`（**绝不**） |
+
+> 行 4/5 的存在理由：`inWindow === false`（本会话身份未知，或它的日志不属本次窗口）时，窗口维度**照常可用**，
+> 但"本会话用没用"**真的一次都没法看**。此时给 `0` 就是凭空捏造一个事实——本项目的第一原则是"绝不把未知伪装成已知"。
+
+#### 2.26.3 合成示例（**增量片段**；载荷合成；与 §2.9 的关系见本小节末）
+
+> **本示例是合成的**（`generatedAt`/`cwd`/窗口时间沿用 §2.9 的合成值，逐项三态数字为**示意**，非本机实测）。
+> 它是 canonical 报告的 **R8 增量片段**：只列与三态 / 窗口边界相关的字段——`scope` 的相关子对象、
+> `items[]` 的相关字段（只列代表项）、`findings.zeroCallBasis`、`totals` 的相关字段。
+> **与 §2.9 的关系**：§2.9 是**完整形状示例**，本节是它的**R8 增量片段**；两处重叠的字段
+> （`scope.currentSession`、逐项三个新字段、`totals.currentSessionObservedCalls`、`findings.zeroCallBasis`）
+> **必须逐字相同**——§2.9 的数字就是从这里取的（`calls` / `tokens` / `findings` 未列出的部分见 §2.9）。
+
+```jsonc
+{
+  "tool": "context_ledger",
+  "version": 4,
+
+  "scope": {
+    "sessionsAvailable": 41,
+    "sessionsScanned": 20,
+    "sessionsUnreadable": 0,
+    "sessionsLimit": 20,
+    "sessionsOutsideWindow": 21,
+    "windowStart": "2026-09-30T00:12:44.001Z",
+    "windowEnd": "2026-10-07T02:38:19.774Z",
+    "windowBasis": "session-log-mtime",
+    "currentSession": { "id": "1f0a2b3c-4d5e-6f70-8192-a3b4c5d6e7f8", "basis": "agent-session-id",
+      "inWindow": true }
+  },
+
+  "items": [
+    // 态 1 —— current-session：本会话调用过
+    { "id": "tools:bash", "name": "bash", "calls": 118,
+      "currentSessionCalls": 41, "sessionsWithCalls": 12, "callPresence": "current-session", "zeroCall": false },
+    { "id": "mcp:mcp__openviking__find", "name": "mcp__openviking__find", "calls": 8,
+      "currentSessionCalls": 3, "sessionsWithCalls": 5, "callPresence": "current-session", "zeroCall": false },
+    { "id": "tools:context_ledger", "name": "context_ledger", "calls": 3,
+      "currentSessionCalls": 2, "sessionsWithCalls": 2, "callPresence": "current-session", "zeroCall": false },
+    { "id": "tools:read", "name": "read", "calls": 4,
+      "currentSessionCalls": 1, "sessionsWithCalls": 3, "callPresence": "current-session", "zeroCall": false },
+    // 态 2 —— historical-only：本会话没用过，窗口内其他会话用过（**不进** findings.zeroCall）
+    { "id": "tools:agent_teams_claim_task", "name": "agent_teams_claim_task", "calls": 4,
+      "currentSessionCalls": 0, "sessionsWithCalls": 2, "callPresence": "historical-only", "zeroCall": false },
+    // 态 3 —— absent：窗口内从未调用（含本会话）；只有这一态进 findings.zeroCall
+    { "id": "tools:task_board_list", "name": "task_board_list", "calls": 0,
+      "currentSessionCalls": 0, "sessionsWithCalls": 0, "callPresence": "absent", "zeroCall": true },
+    { "id": "mcp:mcp__openviking__add_resource", "name": "mcp__openviking__add_resource", "calls": 0,
+      "currentSessionCalls": 0, "sessionsWithCalls": 0, "callPresence": "absent", "zeroCall": true },
+    // 不可观测（instructions / skills 的代表项）：四个次数字段全 null
+    { "id": "skills:genui", "name": "genui", "calls": null,
+      "currentSessionCalls": null, "sessionsWithCalls": null, "callPresence": null, "zeroCall": null }
+  ],
+
+  "findings": { "zeroCallBasis": "model-tool-calls-in-window" },
+
+  "totals": { "observedCalls": 137, "currentSessionObservedCalls": 47 }
+}
+```
+
+**示例自洽校验（新增断言，冻结；与 §2.9 的校验表同属地）**：
+
+| # | 断言 | 期望 |
+|---|---|---|
+| R1 | `sessionsAvailable = sessionsScanned + sessionsUnreadable + sessionsOutsideWindow`（W4） | `41 = 20 + 0 + 21` |
+| R2 | `sessionsScanned + sessionsUnreadable ≤ sessionsLimit`（W5） | `20 ≤ 20` |
+| R3 | `sessionsScanned ≥ 1` ⟹ `windowStart`/`windowEnd` 非 null（W1） | 成立 |
+| R4 | `windowBasis === "session-log-mtime"`（W6） | 成立 |
+| R5 | **三态齐全**：`current-session` 4 项 / `historical-only` 1 项 / `absent` 2 项（片段内） | 成立 |
+| R6 | 各态逐项 `currentSessionCalls ≤ calls` | `41≤118`、`3≤8`、`2≤3`、`1≤4`、`0≤4`、`0≤0` |
+| R7 | `sessionsWithCalls ≤ sessionsScanned`；`calls > 0 ⟹ sessionsWithCalls ≥ 1`；`calls === 0 ⟺ sessionsWithCalls === 0` | `12/5/2/3/2 ≤ 20`；成立 |
+| R8 | `callPresence === "current-session"` ⟺ `currentSessionCalls > 0`（I1） | 成立 |
+| R9 | `calls === null` ⟹ 三个新字段全为 `null`（I2） | `skills:genui` 一行成立 |
+| R10 | `zeroCall === true` ⟺ `callPresence === "absent"`（I7） | 成立 |
+| R11 | `totals.currentSessionObservedCalls = Σ items[].currentSessionCalls(非 null)`（I8） | `47 = 41 + 3 + 2 + 1 + 0(claim_task) + 0(×6 个零调用项，见 §2.9)` |
+| R12 | `totals.currentSessionObservedCalls ≤ totals.observedCalls`（I9） | `47 ≤ 137` |
+| R13 | `scope.currentSession.inWindow === true` ⟺ 存在 `currentSessionCalls !== null` 的项（I4） | 成立 |
+| R14 | `scope.currentSession.id` 匹配 `NAME_PATTERN`；`basis !== "unavailable"` ⟹ `id !== null` | 成立 |
+| R15 | 与 §2.9 的重叠字段逐字相同 | 成立（两处同源数字） |
+
+#### 2.26.4 恒等式与不变量（冻结）
+
+| # | 恒等式 / 不变量 |
+|---|---|
+| I1 | `callPresence === "current-session"` ⟺ `currentSessionCalls > 0` |
+| I2 | `calls === null` ⟹ `currentSessionCalls === null` ∧ `sessionsWithCalls === null` ∧ `callPresence === null` |
+| I3 | `currentSessionCalls === null` **不得**以 `0` 顶替；`sessionsWithCalls === null` 同理（`null` 与 `0` 是两个事实） |
+| I4 | `scope.currentSession.inWindow === true` ⟺ 输入提供了本会话计数通道（`currentSessionCallsByName !== null`，§7.1）；窗口内至少有一个 `tools`/`mcp` 项时，它与"存在 `currentSessionCalls !== null` 的项"等价 |
+| I5 | `currentSessionCalls ≤ calls`（两者非 null 时） |
+| I6 | `sessionsWithCalls ≤ scope.sessionsScanned`；`calls > 0` ⟹ `sessionsWithCalls ≥ 1`；`calls === 0` ⟺ `sessionsWithCalls === 0` |
+| I7 | `zeroCall === true` ⟺ `callPresence === "absent"`（仅 `usageBasis === "tool-calls"` 的项） |
+| I8 | `totals.currentSessionObservedCalls = Σ items[].currentSessionCalls(非 null)`；不存在此类项时恒为 `null`（不是 0） |
+| I9 | `totals.currentSessionObservedCalls ≤ totals.observedCalls`（两者非 null 时） |
+| I10 | `findings.zeroCallBasis === "model-tool-calls-in-window"`（常量） |
+| I11 | `windowBasis === "session-log-mtime"`（常量，§2.2 W6） |
+
+#### 2.26.5 词义与呈现边界（防误读；模型侧、native 渲染、面板、README **都**必须遵守）
+
+1. **"零调用"= 窗口内零调用**。任何输出面**不得**把 `callPresence === "absent"` 或 `zeroCall === true` 写成
+   "从未使用 / 从来没用过 / never used"；`sessionsOutsideWindow === 0` 时**可以**写"窗口覆盖全部 M 个会话"，
+   但**仍不得**去掉"模型工具调用"这一限定（UI / 后台调用不可观测，§2.19）。
+2. **`"historical-only"` 不得渲染成零调用**，也不得写成"没用/该清理"；它的正确读法是"本会话没用过，
+   窗口内其他会话用过"——它**不进** `findings.zeroCall`、`prunePlan`、`hidePlan`（这三个清单的条件仍是 `zeroCall === true`，v4 未改）。
+3. **三态只描述模型工具调用**，不得推广成"该功能被用过/没被用过"。
+4. **不得派生**："平均每次会话调用几次""最活跃会话""最近一次调用时间"之类结论本版**不提供**——
+   最后一项需要读日志时间戳，属未授权读取面（§3.8、§10.2 E2）。
+5. **`currentSessionCalls` 是读取时刻的快照**：**本次**这一次 `context_ledger` 调用（以及尚未落盘的行）**不计入**——
+   DSH 只在会话日志写入后可见。因此它可能比"实际发生过的"少至少 1 次，**不得**当成实时计数器或"我调用了几次"的精确值。
+6. `scope.currentSession.id` 是**标识**，不是用户可见的名字；面板不得把它当标题/用户名展示，也不得据它做任何身份推断。
+
+#### 2.26.6 读取面（结论：**零新增通道**）
+
+v4 的三态与窗口边界**不新增任何读取通道**：全部来自（a）已有的 `tool/call` + `data.name` 计数
+（按会话分组，**与既有回放同一次读取**）；（b）文件系统元数据（日志 `mtime`）；（c）运行时对象
+（`agent.session.id` / 路由的 `?session=`）；（d）既有的 `scope` 计数器。逐条声明见 **§3.8**。
+
+---
+
 ## 3. 冻结项 B：隐私边界的具体落地
 
 红线原文（BRIEF）：允许 **工具名 / 调用计数 / 会话数量与时间戳 / 文件字节数与 token 估算**；
@@ -1181,7 +1533,13 @@ session/title* 行的 data.title            user/message 行的 data.content
 
 - 一条 `tool/call` 记录 = 一次调用；不按 `callId` 去重（DSH 不重复发出同一 call 记录）。
 - 计数按**工具名**聚合：`callsByName: { [name]: integer }`。
-- 账目项的 `calls` = `callsByName[item.name] ?? 0`（仅在 `usageBasis === "tool-calls"` 时成立）。
+- **v4 追加（同一次回放的三个投影，§2.26.1）**：每个会话回放得到的 `callsByName` 在合并进窗口总量之外，
+  还用于产出两个附加投影——`sessionCoverage`（名字 → 出现过该名字的**会话个数**）与
+  `currentSessionCallsByName`（名字 → **当前会话**内的次数；当前会话不在窗口内时为 `null`）。
+  三者出自**同一次逐会话回放**，不得为任何一项另开读取路径（§3.8 第 2 条）。
+- 账目项的 `calls` = `callsByName[item.name] ?? 0`（仅在 `usageBasis === "tool-calls"` 时成立）；
+  `sessionsWithCalls` = `sessionCoverage[item.name] ?? 0`（同上，且必须满足 §2.26.4 I6）；
+  `currentSessionCalls` = `currentSessionCallsByName[item.name] ?? 0`（**仅当**该通道非 `null` 时，§2.26.2）。
 - `scope.toolCalls` = 通过护栏的全部 `tool/call` 行数（= 已匹配项的 `calls` 之和 + `callsUnmatched` + `namesRejected`）；
   `callsUnmatched` = 名字通过护栏但未匹配任何账目项的调用次数之和。
 
@@ -1203,7 +1561,7 @@ session/title* 行的 data.title            user/message 行的 data.content
 |---|---|---|---|
 | S1 | **哨兵不可见** | 构造合成日志：`tool/call` 的 `arguments`、`tool/result` 的 `message`、`user/message` 的 `content`、`session/title` 的 `title` 全部填唯一哨兵 `LEDGER-PRIVACY-SENTINEL-8f3a`（另加中文/emoji 变体）；跑 `usage → reconcile → JSON.stringify(report)` 与 native 渲染 | 两份产物中 `includes("LEDGER-PRIVACY-SENTINEL-8f3a") === false`，且结构等于期望值 |
 | S2 | **载荷不变性（差分证明）** | 同一条日志做两份：A 的载荷字段（`arguments`/`message`/`content`/`title`/`meta`/`error`）全填哨兵 S1；B 的同一批字段替换为**不同长度、不同字符集**的随机垃圾 S2 | 归一化 `generatedAt` 后 `JSON.stringify(A) === JSON.stringify(B)`。这机械地证明输出只是白名单字段（`type` + `name` + 计数）的函数 |
-| S3 | **全局字符串白名单** | 对整份 report 递归遍历所有字符串值，要求每个都命中：枚举常量（`context_ledger`/`token`/`heuristic-v1`/四种 category/四种 usageBasis/`plugin`/`core`/`mcp-server`/`unknown`/`high`/`low`/四种 method/三种 `noRecommendation.reason`/`model-tool-calls-only`/`plugin`/`mcp-server`）、`NAME_PATTERN`、**v2 新增 `PACKAGE_PATTERN`（包名）**、绝对路径（`/` 起始）、ISO-8601 时间戳、`workspaceKey` 形态（`--…--`）、数字字符串 | 无例外；任一字符串不命中即失败。此检查在真实日志 + 真实归属数据的 E2E 上跑；`id` 的 `<category>:` 前缀规则沿用 F1 裁定（`test/whitelist.js`） |
+| S3 | **全局字符串白名单** | 对整份 report 递归遍历所有字符串值，要求每个都命中：枚举常量（`context_ledger`/`token`/`heuristic-v1`/四种 category/四种 usageBasis/`plugin`/`core`/`mcp-server`/`unknown`/`high`/`low`/四种 method/三种 `noRecommendation.reason`/`model-tool-calls-only`/`plugin`/`mcp-server`）、`NAME_PATTERN`、**v2 新增 `PACKAGE_PATTERN`（包名）**、绝对路径（`/` 起始）、ISO-8601 时间戳、`workspaceKey` 形态（`--…--`）、数字字符串 | 无例外；任一字符串不命中即失败。此检查在真实日志 + 真实归属数据的 E2E 上跑；`id` 的 `<category>:` 前缀规则沿用 F1 裁定（`test/whitelist.js`）；**v4 新增常量清单见 §3.8**（`session-log-mtime` / `agent-session-id` / `http-session-param` / `unavailable` / `current-session` / `historical-only` / `absent` / `model-tool-calls-in-window`，外加受 `NAME_PATTERN` 约束的 `currentSession.id`） |
 | S4 | **真实日志 E2E** | 用本机真实会话日志（`~/.dsh/sessions/…/session.v4.jsonl.zstd`，**只读**）跑完整链路，再跑 S3；随后把 S1 的哨兵注入同一日志的载荷字段（写入工作区内的副本，绝不改原日志）后重跑 | ①S3 通过；②注入哨兵前后 report 逐字节相同（除 `generatedAt`）；③`scope.usageAvailable === true` 且 `scope.toolCalls > 0`；④逐项 `findings.zeroCall` 与 `items` 中 `zeroCall === true` 的集合一致（本轮实际有多少零调用项由真实数据决定，**不作为通过前提**） |
 | S5 | **溯源哨兵（v2 新增）** | 在工作区内造一个**假插件包**（目录名与 `package.json.name` 用合法包名，源码里含唯一哨兵 `LEDGER-PROVENANCE-SENTINEL-5c71`，并注册一个假工具名），把它放进 profile 候选包集合的替身（测试夹具）后跑完整链路；再跑 S3 | ①输出中 `includes("LEDGER-PROVENANCE-SENTINEL-5c71") === false`；②该假工具 `providedBy.kind === "plugin"` 且 `name` = 假包名；③S3 对新增字符串（包名 / evidenceFile）零违规；④`evidenceFile` 指向**文件路径**且不含该文件任何内容片段 |
 
@@ -1262,6 +1620,40 @@ R6 **不新增任何读取面**：
 
 ---
 
+### 3.8 R8（v4）不新增读取面（逐条声明）
+
+v4 只增加**口径与呈现**，读取面**一个字节都没多读**。逐条对应：
+
+| 新增的字段 / 结论 | 来源 | 是否新增读取通道 |
+|---|---|---|
+| `items[].sessionsWithCalls` | 既有回放结果**按会话分组**后的会话个数（`readSessionUsage` 本来就逐会话产出 `callsByName`，宿主在同一个循环里多记一个计数） | ❌ 不是（同一批行、同一次读取） |
+| `items[].currentSessionCalls` | 同上，取"当前会话那一个"的计数 | ❌ 不是 |
+| `items[].callPresence` | 由上面两个数与 `calls` 判定（§2.26.2） | ❌ 不是（纯判定） |
+| `scope.currentSession.id` | **运行时对象**：模型半区 `agent.session.id`；路由半区 `?session=`（§1 已核验） | ❌ 不是（不读文件、不读日志） |
+| `scope.currentSession.basis` / `inWindow` | 同上 + 本次窗口的会话集合 | ❌ 不是 |
+| `scope.windowStart` / `windowEnd` | 会话日志文件的 `mtime`（**文件系统元数据**） | ❌ 不是（v1 起就在用：选择窗口时本来就要 stat） |
+| `scope.windowBasis` | 常量，声明上面那一行的依据 | ❌ 不是 |
+| `scope.sessionsOutsideWindow` | 既有计数器的算术（§2.2 W4） | ❌ 不是 |
+| `totals.currentSessionObservedCalls` / `findings.zeroCallBasis` | 由上述字段汇总 / 常量 | ❌ 不是 |
+
+**三条硬规则（v4 的红线，违反即缺陷）**：
+1. **不得**为"最近一次调用时间""调用发生在哪一轮"读日志行内的 `time` / `data.turn` / `data.step`
+   ——它们不在 §3.1 的白名单里，v4 **不**为任何新字段放宽白名单。窗口边界**只**允许用文件系统元数据表达（§2.2 第 4 条）。
+2. **不得**为"本会话调用数"另开一条读取路径（例如单独再解压一次当前会话日志以外的文件、或换一个计数函数）：
+   它必须来自**同一次**逐会话回放。理由与 §7.1 的"单一生产者"同源（v2 F2 的教训，v4 一并收口）。
+3. **`scope.currentSession.id` 必须先过 `NAME_PATTERN`**：不匹配即按"取不到"处理（`null` + `"unavailable"`），
+   并把该情形当作 `namesRejected` 同级的告警信号。会话 id 来自宿主运行时字符串，**不得**让它成为
+   绕过 §3.3 护栏的旁路（这条与 F1 的 `<category>:` 特例同级看待：白名单的例外必须有明确的**声明侧**来源论据，
+   而 `NAME_PATTERN` 恰好就是为这类"外来字符串"设计的锁）。
+
+**S3 白名单需新增的字符串类别（v4；全部是固定枚举常量 + 一个受护栏约束的 id）**：
+`"session-log-mtime"` · `"agent-session-id"` · `"http-session-param"` · `"unavailable"` ·
+`"current-session"` · `"historical-only"` · `"absent"` · `"model-tool-calls-in-window"` ·
+以及 `scope.currentSession.id`（**必须**命中既有的 `NAME_PATTERN`，不新开规则）。
+其余新增字段都是数字或布尔，不引入新字符串类别。
+
+---
+
 ---
 
 ## 4. 冻结项 C：面板信息层级
@@ -1274,24 +1666,33 @@ R6 **不新增任何读取面**：
 
 | 项 | 结论 |
 |---|---|
-| 客户端插槽 | `conversation.input.right`（`kind: 'list'`，落座不挤占内置计量条） |
+| 客户端插槽（**触发入口**，v1 既有） | `conversation.input.right`（`kind: 'list'`，落座不挤占内置计量条） |
+| **承载位置（C6，v4 追认 R7 已交付的实现）** | **右侧栏 tab 为正文承载位置**：tab 类型注册进 `ctx.sidebarRightTabs`（`id`/`kind` = `context-ledger`），正文与标题两个座位 `sidebar.right.pane.tab` 与 `sidebar.right.pane.tab.title` 用**同一个 key**（= tab 类型 id）注册；点击 composer 控件时先调 `ctx.sidebarRight.openTab(kind)`，**同一步**展开该栏。两个位置（composer 浮层 / 右侧栏）**共用同一个面板组件与同一份词典**，因此 §4.2/§4.7/§4.8/§4.9 的呈现义务在**任一位置都一条不减** |
+| 降级（v1 既有，v4 明确为硬要求） | `sidebarRightTabs` / `sidebarRight` 缺席（老宿主 / headless）或 `openTab` 抛错时，**回退**到 composer 就地浮层；**不得抛错、不得让控件变成死按钮**。可选集成**不得**写成静态 `inject`（那会把可选集成变成硬依赖，使缺该包的 profile 加载失败） |
 | 落座标识 | `id: "context-ledger"`，`order: 21`（与 context-doctor 的 20 错开） |
-| 数据入口 | `GET /api/context-ledger/ledger?session=<id>&sessions=<n>` → `{ ok: boolean, report: <canonical JSON> }`；宿主侧 60s 缓存（v1 既有）；无 `httpServer` 服务时跳过路由注册（headless 下工具仍可用） |
+| 数据入口 | `GET /api/context-ledger/ledger?session=<id>&sessions=<n>` → `{ ok: boolean, report: <canonical JSON> }`；宿主侧 60s 缓存（v1 既有）；无 `httpServer` 服务时跳过路由注册（headless 下工具仍可用）。**v4**：该路由解析出的 `?session=` 是 `scope.currentSession.id` 的**两个合法来源之一**（`basis: "http-session-param"`，§2.2）；解析成功但拿不到 agent 时**仍要**把该 id 传下去（否则"本会话调用数"会无谓退化成不可判定） |
 | **`?cwd=` 旋钮：v2 移除（收口 O2）** | **面板与路由只接受 `?session=<id>`**。`?cwd=` 是实现自加的表面、不在任何设计中，且它必然产出**无 agent scope 的降级成本侧**（`ctx.tools.schemas()` 退回全局视图，实测退化为 1 项）——用户无法把这种"混合态"与真实发现区分开，正是本项目禁止的"把推断/降级写成事实"。缺 `session` 或会话无法解析时返回**显式错误** `{ ok: false, error: "session-unresolved" }`（HTTP 4xx），**不得**用降级报告顶替 |
 | 刷新 | 打开时拉取 + 手动刷新按钮；失败显示错误态；不在后台轮询 |
 | 语言 | 命名空间 `context-ledger`，zh/en 双词典；数字用等宽，正文继承宿主 UI 字体（含 CJK 回退） |
-| 主题 | 沿用宿主 CSS 变量（`--dsw-alias-*`），不硬编码配色 |
+| 主题 | 沿用宿主 CSS 变量（`--dsw-alias-*`），不硬编码配色。**字号不在本契约的冻结范围**（无字号字段/无字号义务）：面板字号策略以 `IMPLEMENTATION-NOTES.md` 的界面决定备案为准（对齐宿主 `--dsw-font-*` 阶梯），改字号**不需要**改 DESIGN |
 
 ### 4.2 版面层级（自上而下，冻结 5 段）
 
 1. **标题行**：`Context Ledger` / 副标题「常驻成本 × 实际调用对账」+ 更新时间 + 刷新按钮。
-2. **对账总览（3 个数字，主视觉）**：
+2. **对账总览（主视觉；v1 的 3 个数字 + v4 的窗口与本会话两个补充）**：
    - 常驻合计 `totals.residentTokens`
    - 观测调用 `totals.observedCalls`（副行：覆盖 `scope.sessionsScanned` / `scope.sessionsAvailable` 个会话，`windowStart→windowEnd`）
    - 每次使用成本 `totals.observableTokensPerCall`（副行：可观测部分 `totals.observableTokens` token）
+   - **v4 新增（必填，不再是"可选副行"）**：
+     ①**窗口口径行**：`sessionsScanned` / `sessionsAvailable` 个会话 + `windowStart → windowEnd`；
+     `scope.sessionsOutsideWindow > 0` 时必须追加一行「另有 N 个更早会话未纳入本次扫描」（这是"窗口 vs 磁盘"的显式交代）；
+     ②**本会话调用**：`totals.currentSessionObservedCalls`（`null` 时显示"不可判定"，**不得**显示 0）。
 3. **对账清单（本插件的核心，唯一新增价值）**：三段排列，各取 `findings`：
    - 「**零调用**」= `findings.zeroCall`：每行 `name` + 分类徽标 + `tokens` + 琥珀色 `0 次` 徽标。
      **标题不得**写成"贵且没用"或任何等同"没用"的说法（v2 修订：调用次数只证明"没被模型调用"）。
+     **v4 追加（必填）**：标题必须写明**窗口口径**（zh「零调用（扫描窗口内）」），且该段底部常驻一行窗口声明
+     （`scope.sessionsScanned`/`sessionsAvailable` + `windowStart→windowEnd` + `sessionsOutsideWindow` > 0 时的"另有 N 个更早会话未纳入"）。
+     这是 `findings.zeroCallBasis` 的人类可读对应物（§5 末条）。
    - 「**每次使用最贵**」= `findings.topPerUse`：每行 `name` + 分类徽标 + `tokens` + `calls` + `tokensPerCall`。
    - 「**裁剪候选**」= `findings.prunePlan`（v2 新增，见 §4.7）：每行 = 单元名 + 工具数 + 可省 token +
      同单元在用工具数 + 事实包名；**必须**带固定不确定性声明行。
@@ -1299,7 +1700,9 @@ R6 **不新增任何读取面**：
 4. **四类明细**：固定顺序 4 行（`instructions` / `skills` / `tools` / `mcp`），每行 = 分类名 +
    `itemCount` + `tokens` + 占比条（`tokens / totals.residentTokens`）；点开为该类条目行（顺序见 §4.3）：
    - `tools` / `mcp` 行：`name` + `tokens` + `calls` + `tokensPerCall`（零调用项带徽标）+
-     **归属徽标**（v2 新增）：插件包名 / `DSH 自带` / `MCP: <server>` / `归属未知`（低置信时带 `?`，见 §4.7）。
+     **归属徽标**（v2 新增）：插件包名 / `DSH 自带` / `MCP: <server>` / `归属未知`（低置信时带 `?`，见 §4.7）+
+     **v4 新增**：`currentSessionCalls`（本会话调用）与 `sessionsWithCalls`（覆盖会话数，写作 `2/20 会话`）+ 三态徽标
+     （§4.9 第 5 条）。**三个数必须同屏且互不可加**（§4.9 第 1 条）。
    - `instructions` 行：`name`（短标签取路径尾段，完整路径进 `title`）+ `tokens` + 未知标记 + 说明「常驻，无调用信号」。
    - `skills` 行：`name` + `tokens` + 未知标记 + 说明「逐项不可观测（技能名在工具参数中）」；
      分类行额外展示 `mechanismCalls` / `mechanismTokensPerCall`：「9 次技能加载 · 43 token/次」。
@@ -1320,7 +1723,7 @@ R6 **不新增任何读取面**：
 
 面板**不得**自行重排 canonical 顺序做"优化"（避免同一数据两处不同读法）；需要新排序时改 DESIGN 版本。
 
-### 4.4 四种状态必须视觉可区分（冻结）
+### 4.4 状态必须视觉可区分（冻结；v1 四种 + v2 一种 + v4 三种 = 8 行）
 
 | 状态 | 触发条件 | 视觉 | 文案（zh / en） |
 |---|---|---|---|
@@ -1328,9 +1731,16 @@ R6 **不新增任何读取面**：
 | **未知（不可观测）** | `calls === null` 且 `usageBasis ∈ {unobservable, always-on}` | 中性灰徽标，**不使用**零调用样式 | `未知` / `n/a` |
 | **无证据（降级）** | `calls === null` 且 `usageBasis === "no-evidence"`（即 `scope.usageAvailable === false`） | 面板顶部一条提示条，清单段显示空态 | `未读到会话日志，无法判定调用次数` / `no session-log evidence; call counts unavailable` |
 | **归属未知 / 低置信（v2 新增）** | `providedBy.kind === "unknown"` 或 `confidence === "low"` | 归属徽标用中性灰 + 问号；**不使用**确定语气 | `归属未知` / `attribution unknown`；低置信为 `归属（推断）` / `attribution (inferred)` |
+| **本会话已用（v4 新增）** | `callPresence === "current-session"` | 中性/正向徽标（**不**用琥珀告警样式） | `本会话已用` / `used in this session` |
+| **本会话未用·历史会话用过（v4 新增）** | `callPresence === "historical-only"` | 中性徽标；**必须**与"零调用"视觉可区分（不得用琥珀 `0 次` 样式） | `本会话未用 · 历史会话用过` / `not in this session · used in earlier ones` |
+| **本会话不可判定（v4 新增）** | `currentSessionCalls === null` 且 `callPresence === null` 且 `calls !== null`（即 `scope.currentSession.inWindow === false`） | 中性灰徽标，文案注明原因 | `本会话：不可判定（未进入扫描窗口）` / `this session: n/a (outside the scan window)` |
 
 硬规则：`calls === null` **绝不**渲染成 `0`，**绝不**计入零调用计数，**绝不**进入 `findings.zeroCall`；
 `providedBy.kind === "unknown"` 的项**绝不**出现在可执行候选里（只能进 `noRecommendation`）。
+**v4 追加三条硬规则**：
+①`currentSessionCalls === null` **绝不**渲染成 `0`（渲染成"不可判定"+ 原因，见上表第 4 行）；
+②`callPresence === "historical-only"` **绝不**使用零调用样式、**绝不**计入 `findings.zeroCall`；
+③三态徽标与"零调用"徽标**必须**在视觉上可区分（同一行里不得出现两个琥珀"0 次"含义冲突的标记）。
 
 ### 4.5 面板文案键（冻结命名空间与键集，zh/en 必须同键）
 
@@ -1349,6 +1759,38 @@ v1 键集（保持）：
 `cl.reason.core` · `cl.reason.no-owner-bundle` · `cl.reason.unknown-attribution` ·
 `cl.providedBy.plugin` · `cl.providedBy.core` · `cl.providedBy.mcp-server` · `cl.providedBy.unknown` ·
 `cl.providedBy.inferred` · `cl.providedBy.evidence` · `cl.providerScanCapped`
+
+**v3 采信键（45 键，C3；v4 采信，键名与取值一字不改）**：R6 轮实现新增并在测试里钉死的键集，v4 **照单采信**进契约。
+**禁止**改名、禁止合并、禁止删减（改名会同时击穿已上屏文案与测试）：
+
+`cl.hidePlanTitle` · `cl.hidePlanHint` ·
+`cl.hide.registryUseLabel` · `cl.hide.registryUseBasis` ·
+`cl.hide.verdict.unconfirmed` · `cl.hide.verdict.modelObserved` ·
+`cl.hide.precheckLabel` · `cl.hide.precheck.prechecked` · `cl.hide.precheck.unvalidated` · `cl.hide.precheck.unsupported` ·
+`cl.hide.reason.not-in-restrictable-names` · `cl.hide.reason.no-agent-scope` · `cl.hide.reason.interface-absent` · `cl.hide.reason.reserved-name` ·
+`cl.hide.selfToolNote` · `cl.hide.referencedElsewhere` · `cl.hide.unvalidatedBanner` ·
+`cl.hide.denyListLabel` · `cl.hide.copyDenyList` · `cl.hide.copied` · `cl.hide.copyUnavailable` ·
+`cl.hide.applyModeLabel` · `cl.hide.applyMode.suggestionOnly` · `cl.hide.applyMode.appliedByConfig` ·
+`cl.hide.applyApplied` · `cl.hide.applySkipped` ·
+`cl.hide.caveatTitle` · `cl.hide.caveat.registryHideIsTotal` · `cl.hide.caveat.nonModelRegistryCalls` · `cl.hide.caveat.serviceCoupling` · `cl.hide.caveat.confirmationRequired` · `cl.hide.caveat.prefixCacheCost` ·
+`cl.hide.restoreTitle` · `cl.hide.restoreStep1` · `cl.hide.restoreStep2` · `cl.hide.restoreStep3` ·
+`cl.hide.restoreSubagent` · `cl.hide.restoreNoUndo` · `cl.hide.restoreReadonly` ·
+`cl.hide.parallelTitle` · `cl.hide.parallelHint` · `cl.hide.unitHideLine` · `cl.hide.unitPruneLine` ·
+`cl.hide.noUninstall` · `cl.hide.noSum`
+
+**v4 新增键（R8 必需；键名冻结，zh/en 同键；同义处复用既有键，不另立）**：
+`cl.windowScope`（窗口口径行）· `cl.windowOmitted`（另有 N 个更早会话未纳入）·
+`cl.currentSessionCalls`（本会话列标签）· `cl.sessionCoverage`（覆盖会话数，`{n}/{scanned}`）·
+`cl.currentSessionTotal`（总览里的本会话调用数）· `cl.currentSessionUnknown`（本会话：不可判定）·
+`cl.currentSessionOutsideWindow`（原因：未进入扫描窗口）·
+`cl.presence.currentSession` · `cl.presence.historicalOnly`（三态徽标；`absent` **复用**既有的 `cl.neverCalled`）
+
+**复用规则（沿用 t15 的裁定）**：同一概念在两种动作/两种状态下**必须复用同一个键**，不另立同义键
+（例：`cl.hide.noUninstall` 复用 R1 的 `pruneUnitPlugin`/`McpServer` 语义；`absent` 态复用 `cl.neverCalled`）。
+**既有键的取值一律不动**——包括 `cl.zeroCallTitle`：v4 的窗口口径**不靠改它的文案**实现，而是靠
+`cl.windowScope` / `cl.windowOmitted` 两行（§4.2 第 3 段要求它们常驻零调用段底部）。
+理由：改既有键取值会同时击穿已上屏文案与测试里的冻结值断言，而本轮有面板线（t3）在并行施工——
+契约必须能**只靠新增键**满足，不制造跨线冲突。
 
 产品名词（`token`、`schema`、`MCP`、`Context Ledger`）两种语言都不翻译（沿用 context-doctor 的约定）。
 键值文案的**语义约束**见 §4.7（这是契约，不只是命名）。
@@ -1406,6 +1848,34 @@ v1 键集（保持）：
 5. 未校验（`unvalidated` / `unsupported`）时，段内显示"未校验，不要直接照抄清单"的提示条，
    且**不显示**复制按钮。
 6. `selfTool === true` 的候选（`context_ledger` 自身）要显示"隐藏后模型将无法再调用本账本"。
+7. **v4 追加（C6 · 承载位置）**：以上 1–6 条在**右侧栏 tab** 位置上**同样逐条成立**（两个位置共用同一份映射与同一份词典）。
+   右侧栏正文不是"简版"：§4.2 的五段层级、§4.7 的七条、本节的六条与 §4.9 的六条**一条不减**；
+   差异只允许在外层版式（不再绝对定位、不再限高，交给栏自己滚动）。
+   面板**不得**为右侧栏另做一套数据映射或另算任何数字（§5 的 v4 第 1 条）。
+
+---
+
+### 4.9 R8 面板呈现义务（v4 新增；**两个承载位置都适用**）
+
+本版把"调用次数"拆成三个数，**呈现规则就是产品行为**：错一行就会把"最近没用"读成"从来没用"。
+
+1. **三个数必须同屏，且互不可加**：`calls`（窗口总调用）· `currentSessionCalls`（本会话）·
+   `sessionsWithCalls`（覆盖会话数，**必须**带分母写作 `2/20 会话`，分母 = `scope.sessionsScanned`）。
+   **禁止**把三者相加/相减/相乘，**禁止**合并成一个"总调用"数字，**禁止**据此展示"平均每次会话调用"
+   或"最活跃会话"等派生结论（§2.26.1 硬规则 3）。`tokensPerCall` 仍按 `calls` 显示，不得换分母。
+2. **窗口口径常驻**：总览段（§4.2 第 2 段）与零调用段（§4.2 第 3 段）**都**必须出现窗口声明行
+   （`cl.windowScope`：`sessionsScanned`/`sessionsAvailable` + `windowStart → windowEnd`），
+   且 `scope.sessionsOutsideWindow > 0` 时**必须**追加 `cl.windowOmitted`（"另有 N 个更早会话未纳入本次扫描"）。
+   这两行是 `findings.zeroCallBasis` 的人类可读对应物，**不得**收进 tooltip、**不得**折叠。
+3. **`null` 的呈现**：`currentSessionCalls === null` **不得**显示 `0`；显示"不可判定"，
+   且当 `scope.currentSession.inWindow === false` 时**必须**给出原因文案（`cl.currentSessionOutsideWindow`）。
+   `sessionsWithCalls === null` 同理（显示"不可判定"，不显示 `0/20`）。
+4. **`scope.currentSession` 的呈现**：`basis === "unavailable"` 时显示"本会话身份未知（**不计为 0 次**）"；
+   `id` 只作标识，**不得**当标题/用户名展示（§2.26.5 第 6 条）。
+5. **三态徽标（§4.4 的三行新增）必须落地上屏**：`current-session` / `historical-only` / `absent`
+   三态**视觉可区分**；`absent` 才用零调用样式；`null` 不显示徽标（显示"不可判定"）。
+6. **清单口径不扩张**：`historical-only` 的项**不得**出现在"零调用""裁剪候选""可隐藏候选"三段里
+   （这三段的入组条件仍是 `zeroCall === true`，v4 未改）；面板**不得**自行把三态用于筛选这三段。
 
 ---
 
@@ -1424,6 +1894,17 @@ v1 键集（保持）：
 - **v2 提示词的对应关系**：`findings.prunePlanBasis = "model-tool-calls-only"` 是机器可读的"证据边界"声明，
   `renderLedger` 的末行与面板的 `cl.prunePlanCaveat` 是它的人类可读对应物——**三者必须同时存在**，
   不允许只在 JSON 里声明而界面不提。
+- **v4（三态与窗口）**：
+  1. 模型半区与面板半区**共用同一份**三个数（`calls` / `currentSessionCalls` / `sessionsWithCalls`），
+     面板**不得**重算其中任何一个，也不得由它们派生新数字（§2.26.1 硬规则 3）。
+  2. `scope.currentSession.inWindow === false` 时，**两处**都必须把"本会话"呈现为不可判定；
+     不允许模型半区按 0 说、面板按"未知"说（**同源分歧即缺陷**，与 §7.1 单一生产者同源）。
+  3. `findings.zeroCallBasis = "model-tool-calls-in-window"` 是机器可读的**窗口边界**声明；
+     它的两个人类可读对应物是 `cl.windowScope` 与 `cl.windowOmitted`（面板）以及 §2.10 描述里的
+     窗口限定句（模型）——**三者必须同时存在**。既有 `prunePlanBasis`/`hidePlanBasis` 的值**不动**
+     （它们声明的是"依据什么证据"，与本条声明的"证据覆盖到哪"正交，二者都必须在场）。
+  4. 时间字段一律 ISO-8601 UTC：`generatedAt` / `windowStart` / `windowEnd`；面板按本地时区渲染，
+     并**必须**与 `windowBasis` 一起呈现（否则会被读成"日志内的事件时间"）。
 
 ---
 
@@ -1450,6 +1931,13 @@ v1 键集（保持）：
     **不得**把 `hidePlan` 的 token 与 `prunePlan` 的 token 相加作为"总可省"；
     **不得**在 `verdict !== "unconfirmed"` 之外给 `registryUse` 赋值（枚举只留语义占位）。
     违反即为缺陷（与 §6 第 10 条同源：把未知伪装成已知）。
+12. **v4 补充（窗口 / 时间戳 / 三态三条红线，均属"不做"）**：
+    ①**不探测窗口外的调用**：回答"窗口外用过没有"需要读任意多个窗口外会话，次数无上界；
+    窗口外唯一可见的事实是 `scope.sessionsOutsideWindow` 这个数量。要更大覆盖只能调大 `sessions`（§2.26 开头）；
+    ②**不读日志时间戳**：`windowStart`/`windowEnd` 只允许来自日志文件的 `mtime`（文件系统元数据），
+    **不**读行内 `time`、**不**为"最近一次调用时间"新增任何字段或读取面（§3.8 第 1 条；触发 §10.2 E2）；
+    ③**不得**把三态推广成"功能有没有用"：`callPresence` 只描述**模型工具调用**，
+    不得与 `providedBy`/省额混算，也不得用来重排或筛选 `zeroCall`/`prunePlan`/`hidePlan` 三段（§4.9 第 6 条）。
 
 ---
 
@@ -1461,29 +1949,43 @@ v1 键集（保持）：
 | `lib/cost.js` | `instructionItems(files, root): LedgerItem[]`、`skillItems(skillList): LedgerItem[]`、`toolItems(schemas): LedgerItem[]` | 纯函数；入参为**数据**（不碰宿主、不碰 fs）；产出 §2.4 的**成本侧**字段 |
 | `lib/usage.js` | `countToolCalls(lines: Iterable<string>, limit: number): UsageResult`，其中 `UsageResult = { callsByName, linesRead, toolCalls, skillToolCalls, namesRejected, truncated }` | 纯函数；输入为**已解压的行**；越界由调用方夹取；只读 `type` + `data.name`（§3.1） |
 | **`lib/provide.js`（v2 新增）** | `scanCorpus(corpus, names): ScanResult`、`attributeNames(names, hits, bundles): ProvidedByByName`、`buildPrunePlan(items, providedByByName, bundleOwners): { prunePlan, prunePlanReclaimableTokens, noRecommendation }`；`ScanResult = { strongHits, weakHits, files, bytes, capped }` | **纯函数**：入参为**已读文本**（`corpus: { [pkg]: Array<{path, text}> }`、bundle patch 文本、profile manifest 数据），**绝不自己读盘**（§3.4 的 grep 判据）；实现 §2.13/§2.14/§2.15/§2.16 全部规则 |
-| `lib/reconcile.js` | `reconcile(input: ReconcileInput): LedgerReport`（§2.1 全量对象）、`renderLedger(report): string`（§2.11） | 纯函数；**核心价值所在**；负责 §2.7 排序、§2.6 恒等式、`findings` 截断、§2.13/§2.15 的注入与 §2.16 恒等式，并写入 `version: 3` |
-| `index.js` | 宿主胶水：注册 `context_ledger`、HTTP 路由、`zstd -dc` 子进程读取、`DSH_HOME`/`DSH_PROFILE_DIR` 解析、会话目录发现（`projectKey` 纯函数实现）、**v2 新增**：读 profile manifest 与 bundle patch、遍历两个扫描根、把文本交给 `lib/provide.js` | 唯一允许 import `@deepseek-ai/*` **与唯一允许读盘**的文件；`lib/**` 不得 import 宿主包（否则 `node --test` 跑不起来） |
-| `client.js` | 浏览器半区：插槽落座 + 浮层（§4）；v2 增加候选单元段与归属徽标（R2） | 不得反向依赖 `lib/usage.js` 的日志逻辑；不得自行重算归属或省额 |
+| `lib/reconcile.js` | `reconcile(input: ReconcileInput): LedgerReport`（§2.1 全量对象）、`renderLedger(report): string`（§2.11） | 纯函数；**核心价值所在**；负责 §2.7 排序、§2.6 恒等式、`findings` 截断、§2.13/§2.15 的注入与 §2.16 恒等式、**v4 的三态与窗口判定（§2.26）**，并写入 `version: 4` |
+| `index.js` | 宿主胶水：注册 `context_ledger`、HTTP 路由、`zstd -dc` 子进程读取、`DSH_HOME`/`DSH_PROFILE_DIR` 解析、会话目录发现（`projectKey` 纯函数实现）、**v2 新增**：读 profile manifest 与 bundle patch、遍历两个扫描根、把文本交给 `lib/provide.js`；**v4 新增**：逐会话回放**顺便**产出 `sessionCoverage` 与 `currentSessionCallsByName`（同一次读取，§3.8）、从 `agent.session.id` / `?session=` 取 `scope.currentSession`、由日志 `mtime` 写入窗口边界 | 唯一允许 import `@deepseek-ai/*` **与唯一允许读盘**的文件；`lib/**` 不得 import 宿主包（否则 `node --test` 跑不起来） |
+| `client.js` | 浏览器半区：插槽落座 + 右侧栏 tab（§4.1）+ 浮层（§4）；v2 增加候选单元段与归属徽标（R2）；v3 增加隐藏候选段；**v4 增加三态与窗口口径的呈现（§4.9）** | 不得反向依赖 `lib/usage.js` 的日志逻辑；不得自行重算归属或省额；**v4**：不得重算三个数、不得派生新结论（§4.9 第 1 条） |
 
-### 7.1 `ReconcileInput`（v2 收敛为单一通道，收口 F2/O3）
+### 7.1 `ReconcileInput`（v2 收敛为单一通道；**v4 补齐全部真实通道并收口 F2/C1**）
+
+> **本节在 v4 的目标是"契约 = 实际函数签名"**：v2 只写了 `callsByName` 一个通道，而实现早已在用它之外的
+> 通道（`provenance.weakEvidence`、顶层 `hide`）。这类"契约不描述实际签名"的缺口已被记录两次
+> （v2 的 F2、v3 的 F6）且两次都没被下一版修掉——v4 一次补齐，并加上**变更纪律**（见本节末）。
 
 ```
 ReconcileInput = {
   cwd: string,
-  sessionsRoot: string,
-  scope: Omit<scope, "usageAvailable">,          // 观测范围与计数器（由宿主回放算出）
-  callsByName: Record<string, number>,           // ★ 唯一的调用次数输入通道
-  provenance?: {                                 // ★ 唯一的归属输入通道；缺省 = 全部 unknown
-    byName: Record<string, ProvidedBy>,          //   键 = 工具名 / MCP 名
-    bundleOwners: Record<string, { owner: string | null, removable: boolean }>   // 事实包名 → 卸载单元
+  sessionsRoot?: string,                          // 诊断用（§2.2 的 sessionsRoot），可选
+  scope: Omit<scope, "usageAvailable">,           // 观测范围与计数器（由宿主回放算出；v4 含 currentSession）
+  callsByName: Record<string, number>,            // ★ 窗口总调用（唯一的"窗口总量"通道）
+  sessionCoverage?: Record<string, number> | null,      // ★ v4：工具名 → 覆盖会话数（null = 该维度不可用）
+  currentSessionCallsByName?: Record<string, number> | null, // ★ v4：工具名 → 本会话调用数（null = 不可用）
+  provenance?: {                                  // ★ 唯一的归属输入通道；缺省 = 全部 unknown
+    byName: Record<string, ProvidedBy>,           //   键 = 工具名 / MCP 名
+    bundleOwners: Record<string, { owner: string | null, removable: boolean }>,  // 事实包名 → 卸载单元
+    weakEvidence?: Record<string, string[]>       //   ★ v3 已有、v4 补记：R1 弱命中文件路径（R6 的 nameReferencedElsewhere）
   },
-  items: LedgerItem[],                           // 成本侧字段（cost.js 产出）
-  findingsLimit?: number
+  hide?: {                                        // ★ v3 已有、v4 补记：restrict 探测结果与 opt-in 施加状态（§2.23）
+    status?: "prechecked" | "unvalidated" | "unsupported",   // 缺省 = "unsupported"
+    restrictableNames?: string[] | Set<string> | null,       // 宿主真实类型是 Set；Set/Array 都接受（t18/B1）
+    mode?: "suggestion-only" | "applied-by-config",          // 缺省 = "suggestion-only"
+    interfacePresent?: boolean,                              // 缺省 = status !== "unsupported"
+    appliedNames?: string[]                                  // 缺省 = []（= 本插件什么都没施加）
+  },
+  items: LedgerItem[],                            // 成本侧字段（cost.js 产出）
+  findingsLimit?: number                          // 缺省 = FINDINGS_LIMIT
 }
 ```
 
-**收敛规则（冻结，F2 的结论）**：
-1. **唯一通道**：调用次数**只能**通过顶层 `callsByName` 传入。v1 实现里额外容忍的
+**收敛规则（冻结；规则 1–4 是 v2 的 F2/O3 结论，规则 5–8 是 v4 的增补）**：
+1. **唯一通道（窗口总量）**：窗口总调用**只能**通过顶层 `callsByName` 传入。v1 实现里额外容忍的
    `scope.callsByName`、`item.observedCalls`、`item.calls` **一律不再接受**——
    `reconcile` 必须**忽略并覆盖** `items[].calls` / `items[].observedCalls`（不得让它们参与任何计算）。
    理由（队长裁定 F2）：容忍多通道会让工具入口与 HTTP 路由各走一条路而不自知，行为分歧极难定位。
@@ -1496,6 +1998,28 @@ ReconcileInput = {
    `sessionsScanned` 决定（false）⇒ 全部 `tools`/`mcp` 项为 `no-evidence`、`findings.zeroCall === []`、
    `prunePlan === []`；`reconcile` **不得**重写宿主传入的 `scope` 计数器（保持"输入即事实"）。
    **安全性质**：该状态下不可能产生假零调用或假候选。
+5. **v4 · 每个事实一个通道，但**不得**把同一事实写两遍**：窗口总量只有 `callsByName`；
+   覆盖会话数只有 `sessionCoverage`；本会话调用数只有 `currentSessionCallsByName`。
+   `reconcile` **不得**由 `callsByName` 反推覆盖会话数或本会话数（会造出假事实），
+   也**不得**由后两者反推窗口总量（三者若不一致即宿主缺陷，见规则 7）。
+6. **v4 · `null` 的语义（关键，与 §2.26.4 I3 同源）**：
+   - `sessionCoverage === null`（含缺字段）⇒ 逐项 `sessionsWithCalls = null`（**不得**退化为 0）；
+   - `currentSessionCallsByName === null`（含缺字段）⇒ 逐项 `currentSessionCalls = null`、
+     `callPresence = null`、`totals.currentSessionObservedCalls = null`（**不得**退化为 0）；
+   - `{}` 与 `null` 是**两个事实**：`{}` = "已判定、确实一个都没有"（⇒ `0`）；`null` = "给不出"（⇒ `null`）。
+   这条是 v4 最容易写错的一处：把"缺通道"当成"零"会凭空造出零调用。
+7. **v4 · `scope.currentSession` 的缺省与一致性**：缺字段时补
+   `{ id: null, basis: "unavailable", inWindow: false }`（**缺省填充，不是重写**——宿主给了就必须原样透传）；
+   三条必须同时成立：`basis === "unavailable"` ⟺ `id === null`；`inWindow === true` ⟺
+   `currentSessionCallsByName !== null`（§2.26.4 I4）；`inWindow === false` ⟹ 全部 `currentSessionCalls = null`。
+   三者任一不成立时，**以 `null`（不可判定）为准**，绝不升级为 `0`——这是本项目的取向：宁少报，不假报。
+8. **v4 · 宿主必须保证的三条一致性**（`reconcile` **不得**静默修补，缺陷要暴露给验证线）：
+   `calls > 0 ⟹ sessionsWithCalls ≥ 1`；`calls === 0 ⟹ sessionsWithCalls === 0`；
+   `currentSessionCalls ≤ calls`（§2.26.4 I5/I6）。
+
+**变更纪律（v4 新增，防再犯 F2/F6）**：**任何**新增输入通道（字段或子字段）必须**在同一版 DESIGN 里**
+写进本节，并同时给出：通道名、类型、缺省值、缺省语义（`{}` 还是 `null`）、以及它进入哪个输出字段。
+"实现先加、契约后补"的做法在本项目已造成两次同类回退（F2 → F6 → v4），**不再接受**。
 
 ### 7.2 责任边界（唯一赋权点）
 
@@ -1503,8 +2027,13 @@ ReconcileInput = {
 |---|---|---|
 | `tokens` / `bytes` / `source` / `provider` / `server` / `loadOrder` | `lib/cost.js` | 成本侧（来自声明面与文件） |
 | `calls` / `tokensPerCall` / `zeroCall` / `usageBasis` | `lib/reconcile.js` | 次数语义（**唯一**），输入只有 `callsByName` |
+| **`currentSessionCalls` / `sessionsWithCalls` / `callPresence`**（v4） | **`lib/reconcile.js`** | 三态语义（**唯一**）；输入只有 `sessionCoverage` 与 `currentSessionCallsByName`（§7.1 规则 5/6），**不得**由 `calls` 反推 |
+| **`scope.windowStart` / `windowEnd` / `windowBasis` / `sessionsOutsideWindow` / `currentSession`**（v4） | **`index.js`（宿主）** | 窗口与窗口身份（**唯一**）；`reconcile` 只做缺省填充（§7.1 规则 7），**不得**重写宿主给的窗口计数器（"输入即事实"） |
 | `providedBy`（全部子字段） | `lib/provide.js` 计算 → `lib/reconcile.js` 注入 | 归属语义（**唯一**）；`reconcile` 只做注入与缺省填充，不自行判断归属 |
 | `findings.prunePlan` / `prunePlanReclaimableTokens` / `noRecommendation` | `lib/provide.js` 计算 → `lib/reconcile.js` 注入 | 省额与分组（**唯一**）；面板不得重算 |
+| `findings.hidePlan*` / `hideApply` / `hidePlanCaveat` | `lib/hide.js` 计算 → `lib/reconcile.js` 注入 | 隐藏候选语义（**唯一**）；面板不得重算（§4.8/§2.22） |
+| **`findings.zeroCallBasis`**（v4） | `lib/reconcile.js` | 常量，声明零调用清单的**窗口边界**（§2.5） |
+| **`totals.currentSessionObservedCalls`**（v4） | `lib/reconcile.js` | 由逐项 `currentSessionCalls` 汇总；无此类项时 `null`（§2.6） |
 
 ---
 
@@ -1515,6 +2044,7 @@ ReconcileInput = {
 | v1 | 2026-10-07 | 首次冻结：数据模型（§2）、隐私落地（§3）、面板层级（§4） | 任务 t1 |
 | v2 | 2026-10-07 | **R1 新能力 + v1 遗留收口**（见下方清单）；canonical `version` 1 → 2 | **R1**（任务 t5） |
 | v3 | 2026-10-07 | R6 工具级隐藏建议：`findings.hidePlan`/`hidePlanUnits`/`hideApply`/`hidePlanCaveat`（§2.18–§2.25）、`registryUse` 逐候选判定、作用域模型（**宿主禁止全局限制**，见 §2.23.1）、恢复路径（§2.24）；`version` 2 → 3 | **R6**（任务 t13） |
+| v4 | 2026-10-07 | **R8 三态调用口径 + 窗口边界显式化**（§2.26 + §2.2 的 W1–W6）：`items[].currentSessionCalls`/`sessionsWithCalls`/`callPresence`、`scope.currentSession`/`windowBasis`/`sessionsOutsideWindow`、`totals.currentSessionObservedCalls`、`findings.zeroCallBasis`；**窗口边界不再恒为 null**（W1）；`zeroCall` 语义**一字未改**。同时**收口阻塞性携带项 C1/C2/C3/C6**（§7.1 输入通道补齐 + F2 一并收口、§2.11 采信 R6 渲染段、§4.5 采信 45 键、§4.1/§4.8 追认右侧栏位置）；`version` 3 → 4 | **R8**（任务 t1） |
 
 ### v2 变更清单（可追溯逐条）
 
@@ -1563,6 +2093,72 @@ t5 验收写的是"取值域：插件包名 / core / 未知"（3 值）。队长
 
 ---
 
+### v3 变更清单（可追溯逐条；R6）
+
+| # | 变更 | 位置 |
+|---|---|---|
+| A1 | `findings.hidePlan` / `hidePlanTokens` / `hidePlanUnits` / `hidePlanBasis` / `hidePlanStatus` / `hideApply` / `hidePlanCaveat` 七键冻结 | §2.5、§2.18、§2.20 |
+| A2 | `registryUse` 逐候选判定（`verdict`/`verdictBasis`/`modelCalls`/`nameReferencedElsewhere`/`nonModelCallers`）+ 共享 caveat 五条 | §2.18、§2.19 |
+| A3 | 作用域模型（按 agent，不全局）、名字预校验、接口三态降级、**默认只建议不施加** | §2.23.1–§2.23.4 |
+| A4 | 三种施加载体 + 恢复路径（机制事实与诚实边界） | §2.23.5、§2.24 |
+| A5 | R6 完整示例（增量片段）+ 17 条自洽断言 | §2.21、§2.21.1 |
+| A6 | 隐私：R6 不新增读取面；S3 白名单补枚举 | §3.7 |
+| A7 | 面板：隐藏候选段、与 `prunePlan` 并列、不得相加 | §4.8、§2.22 |
+
+### v4 变更清单（可追溯逐条；R8）
+
+**A. R8 新增（新能力：三态调用口径 + 窗口边界显式化）**
+
+| # | 变更 | 位置 |
+|---|---|---|
+| A1 | `items[].currentSessionCalls` / `sessionsWithCalls` / `callPresence` 三个字段冻结（与既有 `calls` **并存、不可相加**） | §2.4、§2.26.1 |
+| A2 | 三态判定表（7 行，互斥穷尽）+ 三态含义与五种恒等式/不变量（I1–I11） | §2.26.2、§2.26.4 |
+| A3 | 窗口口径与窗口不变量 W1–W6：`windowStart`/`windowEnd` **不再恒为 null**；`windowBasis` 常量声明边界来自**文件 `mtime`**；`sessionsOutsideWindow` 交代窗口外会话数 | §2.2 |
+| A4 | `scope.currentSession`（`id`/`basis`/`inWindow`）+ 三条硬规则（不得猜、不得用 0 顶替、id 必须过 `NAME_PATTERN`） | §2.2、§3.8 |
+| A5 | `totals.currentSessionObservedCalls`（无此类项时 `null`） | §2.6 |
+| A6 | `findings.zeroCallBasis = "model-tool-calls-in-window"`（窗口边界声明，与 `prunePlanBasis`/`hidePlanBasis` 正交） | §2.5 |
+| A7 | §2.10 工具描述补一句窗口限定（模型半区不得再把"窗口内 0 次"说成"从未使用"） | §2.10 |
+| A8 | R8 合成示例（增量片段）+ 15 条自洽断言（R1–R15）+ 与 §2.9 的关系说明 | §2.26.3 |
+| A9 | 面板呈现义务 6 条（三个数同屏不可加、窗口口径常驻、`null` 不得显 0、三态徽标、清单口径不扩张、右侧栏位置同样适用） | §4.9、§4.2、§4.4 |
+| A10 | 隐私：v4 零新增读取通道的逐条声明 + 三条红线（不读时间戳、不另开读取路径、id 过护栏）+ S3 白名单新增清单 | §3.8、§3.4 |
+| A11 | 边界：不做窗口外探测、不读时间戳、不把三态推广成"有没有用" | §6 第 12 条、§2.26.5 |
+| A12 | `categories[]` 本版一字未改，且**不得**把三态上提（类级 `null` 规则会立刻冲突）；面板也**不得**为此自造类级派生数字 | §2.3 |
+| A13 | 计数口径写明"同一次逐会话回放的三个投影"（窗口总量 / 覆盖会话数 / 本会话次数），禁止为任何一项另开读取路径 | §3.2、§3.8 第 2 条 |
+
+**B. 阻塞性携带项收口（`BACKLOG.md` 的「下一次 DESIGN 修订必须完成」——本轮即那一次）**
+
+| # | 项 | v4 终态 | 位置 |
+|---|---|---|---|
+| C1 | §7.1 `ReconcileInput` 无 R6 输入通道（**阻塞级**） | **本轮已收口**：`provenance.weakEvidence` 与顶层 `hide{status,restrictableNames,mode,interfacePresent,appliedNames}` 逐字段写入契约（类型 / 缺省 / 缺省语义 / 落到哪个输出字段），并**一并收口 F2**（v2 只写了 `callsByName` 一个通道，实际签名更大）——§7.1 现在**等于**实际函数签名，并新增"新增通道必须同版写入本节"的变更纪律 | §7.1、§7.2 |
+| C2 | §2.11 无 R6 native 渲染段（6/7 行） | **本轮已收口**：从 `IMPLEMENTATION-NOTES.md` 的 F7 记录**逐字**提升进 §2.11 模板（**未重新措辞**），并给出 7 条逐行判据 | §2.11 |
+| C3 | §4.5 未采信 v3 的 45 个 `cl.hide*` 键 | **本轮已收口**：45 键**照单采信**进 §4.5（键名与取值一字未改，只采信不重命名） | §4.5 |
+| C6 | DESIGN 未收录"右侧栏承载位置" | **本轮已收口**：右侧栏并入 §4.1（座位、key、`openTab`、降级硬要求、不得写静态 `inject`）与 §4.8 第 7 条（两个位置呈现义务一条不减） | §4.1、§4.8 |
+| C4 | §2.21 示例违反 §2.19 升序 + A 清单不完整 | **本轮不做，已排期**：§2.21 的示例与 A1–A17 被面板测试**机械抽取**，DESIGN 与那份测试必须**同一步**改；本轮有面板线（t3）在并行施工，现在动会造成跨线门禁污染。**排期：t3 收敛之后的后续任务**（与 C5 同一任务） | — |
+| C5 | §2.21 夹具无内容指纹（防静默漂移） | **本轮不做，已排期**：并入与 C4 同一个后续任务（给夹具加内容指纹，使漂移变成显式失败） | — |
+| C7 | native 渲染文本仍未把窗口口径写进第 1 行与零调用段标题（t1 新提出） | **本轮不做，已排期**：§2.11 刚按 C2 完成"**逐字**提升"，同版再改既有行会让"逐字"变浑；且会击穿 `renderLedger` 的既有行断言（宿主线）。**确切文案已逐字钉在 `IMPLEMENTATION-NOTES.md` 的「R8 交接 5」**，下个实现任务照抄即可——**注意：模型半区的窗口告知已由 §2.10 的描述句承担**，故本项不造成"模型继续把窗口内 0 读成从未使用" | §2.11（待补） |
+
+**C. 与任务 t1 验收文本的关系（说明，不是差异）**
+
+t1 的验收明确要求"字段名冻结进 §2.5 表与对应小节"——本节按"字段表 = §2.4（`items[]` 字段表）+
+§2.2（`scope` 字段表）+ §2.5（`findings` 表，新增 `zeroCallBasis` 行）"全部落位：
+三个新字段在 §2.4 的字段表里冻结，`zeroCallBasis` 在 §2.5 的表里冻结，窗口字段在 §2.2 的表里冻结，
+判定表与恒等式在 §2.26。其余验收条目（`zeroCall` 语义不变、不新增读取通道、窗口语义 = 扫描窗口内、
+合成示例、`version` 3 → 4 全量同步、历史修订记录保留、只改 `DESIGN.md` + `IMPLEMENTATION-NOTES.md`）**全部照做**。
+
+### v4 的下游影响（实现线与面板线须知）
+
+| 影响面 | 必须做什么 |
+|---|---|
+| canonical 形状 | `version` 常量（`LEDGER_VERSION`）`3` → `4`；`index.js` 的 output schema 补 8 个新键（`currentSessionCalls`/`sessionsWithCalls`/`callPresence`/`currentSession`/`windowBasis`/`sessionsOutsideWindow`/`zeroCallBasis`/`currentSessionObservedCalls`；`additionalProperties: false` 下漏一个就自相矛盾）；同步点：§2.1 表、§2.9 示例、§2.21 示例、§2.12 降级示例、§7 模块契约、§7.2 责任表 |
+| 宿主线（`index.js`） | 逐会话回放时**顺便**累积 `sessionCoverage`（名字 → 会话数）与 `currentSessionCallsByName`（当前会话；不在窗口内时传 `null`）；从 `agent.session.id` / 路由 `?session=` 填 `scope.currentSession`；由日志 `mtime` 填窗口边界与 `sessionsOutsideWindow`；`?session=` 解析成功但无 agent 时**仍要**把 id 传下去 |
+| 纯函数线（`lib/reconcile.js`） | 按 §7.1 规则 5–8 产出三态；**不得**由 `calls` 反推；`null` 与 `0` 严格区分；缺省填充 `scope.currentSession` |
+| 面板线（`client.js` / `test/client-panel.test.mjs`） | §4.9 六条 + §4.4 三行新状态 + §4.5 的 9 个新键（`absent` 复用 `cl.neverCalled`）；**既有键取值一律不动**；`canonicalReport()` 夹具随 v4 形状同步（`version: 4` + 逐项三字段） |
+| 测试 fixtures | `test/reconcile.test.js`（§2.9 形状副本）、`test/client-panel.test.mjs`、`test/host.test.js:484`、`test/privacy.test.js:106`、`test/e2e.test.js:405` 的 scope 键集/断言需补新字段；**§2.9 的 `sessionsUnreadable` 由 1 改为 0**（为满足 W5：`20 + 0 ≤ 20`），引用该值的夹具需同步 |
+| 白名单（`test/whitelist.js`） | 补 §3.8 的 8 个新常量 + `scope.currentSession.id` 走 `NAME_PATTERN` 的规则 |
+| 不改的 | `lib/usage.js` 的读取白名单（§3.1）**不动**；`lib/provide.js` / `lib/hide.js` / `lib/cost.js` / `lib/tokens.js` 无改动 |
+
+---
+
 ## 9. 文件归属矩阵（v2 新增；消除并行写冲突）
 
 **背景（真实事故）**：v1 期间 `package.json` 差点被"宿主实现线"与"面板实现线"同时写
@@ -1605,6 +2201,20 @@ t5 验收写的是"取值域：插件包名 / core / 未知"（3 值）。队长
 | `lib/reconcile.js` | 宿主实现线 | ✅（注入 R6 的 findings 七键） | |
 | `client.js` | 面板实现线 | ✅（§4.8 的段与并列呈现） | 与 `test/client-panel.test.mjs` 同线 |
 | `<profile>/cordis.patch.yml`、子代理描述符 | **用户**（不在仓库内） | ⬜ 本插件只输出片段 | 明确不归任何实现线；本插件不写配置（§2.23.4） |
+
+### 9.2 R8（v4）轮的文件归属（追加表；§9 主表与 §9.1 保持不变）
+
+> 与 §9.1 同规格：主表第三列是 **R1（v2）轮**语义、§9.1 是 **R6（v3）轮**语义，均按"只追加、不重排"原则不修改。
+
+| 文件 | 归属线 | R8（v4）是否触碰 | 备注 |
+|---|---|---|---|
+| `DESIGN.md` | **设计线**（t1 本任务） | ✅ 本轮唯一被写的契约文件（v4，§8 走版本追加流程） | 冻结字段名/取值域/恒等式；实现线不得就地改 |
+| `IMPLEMENTATION-NOTES.md` | **设计线追加**（本轮用于页面字号备案） | ✅ 允许追加（**append-only**） | 不得改写队长既有裁定；本轮追加"界面决定备案：字号对齐 `--dsw-font-*` 阶梯" |
+| `index.js` / `lib/reconcile.js` | **宿主实现线** | ⬜ 本轮不动（v4 的施工在下游任务） | 需按 §2.9/§2.26 与 §8 的"下游影响"施工：`version: 4`、schema 补键、窗口与 `currentSession` 落值、三态判定 |
+| `lib/usage.js` / `lib/provide.js` / `lib/hide.js` / `lib/cost.js` / `lib/tokens.js` | 宿主实现线 | ⬜ 不动 | 读取白名单与纯函数职责均无变化（§3.8、§7） |
+| `client.js` / `test/client-panel.test.mjs` | **面板实现线** | ⬜ 本轮不动 | §4.9 六条 + §4.4 三行 + §4.5 的 8 个新键；**既有键取值不得改**（避免与 t3 已上屏文案/冻结断言冲突） |
+| `test/**`（宿主侧） | 宿主实现线 | ⬜ 本轮不动 | §8"下游影响"已逐条列出需同步的夹具与白名单 |
+| `BACKLOG.md` / `package.json` / `cordis.patch.yml` / `README.md` / `.git/**` / `VERIFY-*.md` | 队长 / 验证线 | ⬜ 不动 | 同 §9 主表；C4/C5 的后续任务由队长排期 |
 
 **R1 分解到线的建议（供队长排任务；不是本设计的强制切分）**：
 宿主线一个任务（`lib/provide.js` + `index.js` + 宿主侧测试与白名单）为最小可验证单元；

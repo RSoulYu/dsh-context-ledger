@@ -172,6 +172,18 @@ window.__ModuleLoader__.load({
       'cl.hide.unitPruneLine': '卸载该单元可省 {tokens} token（代价：失去 {used} 个在用工具，以及该单元的 UI/后台功能）',
       'cl.hide.noUninstall': '无法通过卸载移除',
       'cl.hide.noSum': '两种动作互斥：隐藏的可省 token 与卸载的可省 token 不得相加（不是两笔收益之和）',
+      /* ── v4 新增键（DESIGN §4.5 的 R8 清单，9 个；键名冻结，zh/en 同键）──────────────
+       * 窗口口径不靠改既有键取值实现（`cl.zeroCallTitle` 等一字不动），只靠 `cl.windowScope` /
+       * `cl.windowOmitted` 两行常驻（§4.5 的复用规则）。`absent` 复用既有 `cl.neverCalled`。 */
+      'cl.windowScope': '扫描窗口：{scanned} / {available} 个会话 · {start} → {end} · 边界取自日志文件 mtime（{basis}）',
+      'cl.windowOmitted': '另有 {n} 个更早会话未纳入本次扫描',
+      'cl.currentSessionCalls': '本会话',
+      'cl.sessionCoverage': '覆盖 {n}/{scanned} 会话',
+      'cl.currentSessionTotal': '本会话调用',
+      'cl.currentSessionUnknown': '本会话：不可判定',
+      'cl.currentSessionOutsideWindow': '（未进入扫描窗口）',
+      'cl.presence.currentSession': '本会话已用',
+      'cl.presence.historicalOnly': '本会话未用 · 历史会话用过',
     }
 
     var en = {
@@ -291,6 +303,16 @@ window.__ModuleLoader__.load({
       'cl.hide.noUninstall': 'cannot be removed by uninstalling',
       'cl.hide.noSum': 'the two actions are mutually exclusive: never add the hide tokens to the uninstall tokens '
         + '(they are not two separate savings)',
+      /* ── v4 additions (DESIGN §4.5; 9 keys, same key set as zh) ──────────────────── */
+      'cl.windowScope': 'scan window: {scanned} / {available} sessions · {start} → {end} · bounds from session-log mtime ({basis})',
+      'cl.windowOmitted': '{n} earlier sessions were not scanned this time',
+      'cl.currentSessionCalls': 'this session',
+      'cl.sessionCoverage': '{n}/{scanned} sessions covered',
+      'cl.currentSessionTotal': 'this session',
+      'cl.currentSessionUnknown': 'this session: n/a',
+      'cl.currentSessionOutsideWindow': ' (outside the scan window)',
+      'cl.presence.currentSession': 'used in this session',
+      'cl.presence.historicalOnly': 'not in this session · used in earlier ones',
     }
 
     /**
@@ -349,6 +371,26 @@ window.__ModuleLoader__.load({
 
     /** 宿主同源路由（DESIGN §4.1）：→ { ok: boolean, report: canonical JSON }。 */
     var LEDGER_API = '/api/context-ledger/ledger'
+
+    /**
+     * 右侧栏 tab 的**类型身份**（R7 新增的承载位置；DESIGN v3 §4.1 的"data entry"不变）。
+     *
+     * 契约事实（本机 0.2.0-rc.2 只读核对）：
+     *   · `sidebar.right.pane.tab`（kind: keyed / scope: session）与
+     *     `sidebar.right.pane.tab.title` 由 **同一个 key** 分派，key = tab 类型定义的 `id`
+     *     （`dsh-client-ui-sidebar-right/lib/client.js` 的 `entryKey: definition?.id ?? tab.kind`）；
+     *   · 类型本身注册进 `ctx.sidebarRightTabs`（`SidebarRightTabRegistry.register`），
+     *     `kind` 是 `ctx.sidebarRight.openTab(kind)` 用的类型判别符；
+     *   · `ctx.sidebarRight.openTab` 注释明写"column expands in the same step" ⇒ 点一下即成栏。
+     * 先例：@nanmicoder/dsh-agent-teams 与 dsh-context 的客户端半区都按这个形状注册。
+     */
+    var LEDGER_TAB_ID = 'dsh-context-ledger'
+    var LEDGER_TAB_KIND = 'context-ledger'
+    /** 右侧栏 tab 的两个座位名（同一个 key = LEDGER_TAB_ID）。 */
+    var LEDGER_TAB_SEATS = ['sidebar.right.pane.tab', 'sidebar.right.pane.tab.title']
+    /** 宿主服务名：`sidebarRightTabs` 是可选的注册表，`sidebarRight` 是打开入口。 */
+    var SIDEBAR_TABS_SERVICE = 'sidebarRightTabs'
+    var SIDEBAR_SERVICE = 'sidebarRight'
     /** 明细展开后仍超出的行数用 cl.more 折叠（DESIGN §4.3）。 */
     var DETAIL_LIMIT = 6
     /** 分类固定顺序（DESIGN §2.3：身份稳定优先于量级）。 */
@@ -386,6 +428,28 @@ window.__ModuleLoader__.load({
 
     /** 仅数字用等宽；正文继承宿主 UI 字体（含 CJK 回退），避免中文落到无 CJK 的等宽栈。 */
     var MONO = 'ui-monospace, "SFMono-Regular", "Cascadia Mono", Consolas, monospace'
+
+    /**
+     * 字号与行高：**对齐宿主 `--dsw-font-*` token 阶梯**，不写裸 px（硬编码不会跟随主题/字号缩放）。
+     * 依据：`IMPLEMENTATION-NOTES.md` 的「界面决定备案 · 面板字号对齐 DSH `--dsw-font-*` 阶梯」（R8 / t1）。
+     *
+     * 映射（现状 px → token 档）：9.5 / 10 → `xxxs-11`；**10.5 / 11 → `xxs-12`（主力）**；
+     * 11.5 / 12 → `xs-13`；13 → `s-14`；20（总览数字）保持 `l-20`。
+     * 行高**同步**取同一档的 `-line-height`（字号变大后不得挤字）。
+     */
+    var FS = {
+      xxxs11: 'var(--dsw-font-xxxs-11-font-size, 11px)',
+      xxs12: 'var(--dsw-font-xxs-12-font-size, 12px)',
+      xs13: 'var(--dsw-font-xs-13-font-size, 13px)',
+      s14: 'var(--dsw-font-s-14-font-size, 14px)',
+      l20: 'var(--dsw-font-l-20-font-size, 20px)',
+    }
+    var LH = {
+      xxxs11: 'var(--dsw-font-xxxs-11-line-height, 14px)',
+      xxs12: 'var(--dsw-font-xxs-12-line-height, 18px)',
+      xs13: 'var(--dsw-font-xs-13-line-height, 20px)',
+      s14: 'var(--dsw-font-s-14-line-height, 22px)',
+    }
 
     /* ══════════════════════════════════════════════════════════════════════
      * 纯展示映射（无副作用；`__verify` 缝直接暴露给核验线逐条断言）
@@ -600,6 +664,256 @@ window.__ModuleLoader__.load({
         && typeof report.findings === 'object' ? report.findings : {}
       var rows = findings[key]
       return Array.isArray(rows) ? rows : []
+    }
+
+    /* ══════════════════════════════════════════════════════════════════════
+     * R8/v4 展示映射（DESIGN §2.26 / §4.2 / §4.4 / §4.9；纯函数，零重算）
+     *
+     * 三条硬规则（与 §2.26.1 同源，面板侧一条都不能破）：
+     *   ① **窗口总调用** `/ items[].calls`、**本会话** `currentSessionCalls`、**覆盖会话数**
+     *      `sessionsWithCalls` 是三个互不可加的口径：各自独立成节点、各自有标签，
+     *      面板**不**把它们相加/相减/相乘，也**不**由此派生"平均每次会话调用"之类的结论；
+     *   ② `null`（给不出）**绝不**渲染成 `0`——渲染成"不可判定"并给出原因（`calls === null`
+     *      的既有规则同样成立：那是"未知/无证据"，不是零调用）；
+     *   ③ 三态徽标视觉可区分：只有 `absent` 用零调用（琥珀）样式，另两态用中性/品牌色。
+     * ══════════════════════════════════════════════════════════════════════ */
+
+    /** 三态取值域（§2.26.2）：恰好 3 个 + null；其它取值一律按"给不出"处理，不猜。 */
+    var PRESENCE_VALUES = ['current-session', 'historical-only', 'absent']
+
+    /** 三态 → 颜色（核验线用它证明三态视觉可区分；`historical-only` 绝不能是琥珀）。 */
+    var PRESENCE_TONE = {
+      'current-session': TONE.blue,
+      'historical-only': TONE.muted,
+      absent: TONE.amber,
+    }
+
+    /** 三态 → 颜色（未知/不可判定取中性灰）。 */
+    function presenceColor(presence) {
+      var tone = PRESENCE_TONE[presence]
+      return tone === undefined ? TONE.quiet : tone
+    }
+
+    /** 逐项三态：**只读** canonical 的 `callPresence`，绝不按 `calls` 反推（§2.26.4 I1）。 */
+    function presenceOf(item) {
+      if (item === null || typeof item !== 'object') return null
+      return PRESENCE_VALUES.indexOf(item.callPresence) === -1 ? null : item.callPresence
+    }
+
+    /** 窗口边界与口径（§2.2 W1–W6）：只读 `scope`，窗口外一律不探测、不算任何派生量。 */
+    function windowScopeOf(report) {
+      var scope = report !== null && typeof report === 'object' && report.scope !== null
+        && typeof report.scope === 'object' ? report.scope : {}
+      var start = shortStamp(scope.windowStart)
+      var end = shortStamp(scope.windowEnd)
+      return {
+        scanned: isNum(scope.sessionsScanned) ? scope.sessionsScanned : 0,
+        available: isNum(scope.sessionsAvailable) ? scope.sessionsAvailable : 0,
+        outside: isNum(scope.sessionsOutsideWindow) ? scope.sessionsOutsideWindow : 0,
+        start: start,
+        end: end,
+        /* W6：常量 `session-log-mtime`；只在宿主真的给了字符串时呈现，不自己编一个。 */
+        basis: typeof scope.windowBasis === 'string' && scope.windowBasis !== '' ? scope.windowBasis : '',
+      }
+    }
+
+    /** `scope.currentSession`（§2.2）：`basis` 取不到就如实按 `unavailable` 处理（不猜 id）。 */
+    function currentSessionOf(report) {
+      var scope = report !== null && typeof report === 'object' && report.scope !== null
+        && typeof report.scope === 'object' ? report.scope : {}
+      var current = scope.currentSession !== null && typeof scope.currentSession === 'object'
+        ? scope.currentSession : null
+      /* `basis` 是 §2.2 冻结的三个枚举值之一；形状护栏确保面板**不承载任意宿主串**
+       * （不匹配就按契约里的"取不到"取值 `unavailable` 处理）。 */
+      var raw = current !== null && typeof current.basis === 'string' ? current.basis : ''
+      var basis = /^[a-z][a-z0-9-]{0,31}$/.test(raw) ? raw : 'unavailable'
+      return {
+        basis: basis,
+        /* 缺字段按 false：拿不到"在窗口内"的证据，就不能假装在窗口内。 */
+        inWindow: current !== null && current.inWindow === true,
+      }
+    }
+
+    /** 渲染期上下文（v4）：覆盖会话数的分母 + 本会话是否在窗口内。 */
+    function panelScope(report) {
+      return { window: windowScopeOf(report), current: currentSessionOf(report) }
+    }
+
+    /**
+     * 总览里的「本会话调用」（§4.2 第 2 段 ② / §4.9 第 3、4 条）。
+     * `totals.currentSessionObservedCalls === null` ⇒ "不可判定"（**绝不** 0）；
+     * `inWindow === false` ⇒ 必须给出原因文案（`cl.currentSessionOutsideWindow`）。
+     * `basis` 只作为标识来源呈现，绝不把 `id` 当标题/用户名（§2.26.5 第 6 条）。
+     */
+    function currentSessionSummary(report, t) {
+      var totals = report !== null && typeof report === 'object' && report.totals !== null
+        && typeof report.totals === 'object' ? report.totals : {}
+      var current = currentSessionOf(report)
+      var known = isNum(totals.currentSessionObservedCalls)
+      return {
+        label: t('cl.currentSessionTotal'),
+        value: known ? formatInt(totals.currentSessionObservedCalls) : t('cl.currentSessionUnknown'),
+        unknown: !known,
+        basis: current.basis,
+        inWindow: current.inWindow,
+        reason: current.inWindow ? null : t('cl.currentSessionOutsideWindow'),
+      }
+    }
+
+    /**
+     * 三态徽标（§4.4 的 v4 三行 / §4.9 第 5 条）：
+     *   `current-session` → 品牌色（中性偏正向，**不**用琥珀告警样式）；
+     *   `historical-only` → 中性灰（**绝不**用零调用样式，否则会被读成"零调用"）；
+     *   `absent`          → **不**另画徽标：该行的次数格已经是零调用徽标（`cl.neverCalled`），
+     *                       同一行里出现两个琥珀「0 次」正是 §4.4 v4 硬规则③禁止的；
+     *   `null`            → 不画徽标（由「不可判定」文案承担）。
+     */
+    function presenceBadge(presence, t) {
+      if (presence === 'current-session') {
+        return h('span', {
+          key: 'presence', 'data-cl-presence': 'current-session', style: presenceCurrentStyle,
+        }, t('cl.presence.currentSession'))
+      }
+      if (presence === 'historical-only') {
+        return h('span', {
+          key: 'presence', 'data-cl-presence': 'historical-only', style: presenceNeutralStyle,
+        }, t('cl.presence.historicalOnly'))
+      }
+      return null
+    }
+
+    /**
+     * 逐项 v4 行（§4.2 第 4 段 / §4.9 第 1、3、5 条）：三态徽标 + 本会话数 + 覆盖会话数。
+     *
+     * 只有**次数可观测**的项才有这一行（`calls !== null`）：`instructions` / `skills` 没有"调用"
+     * 这个动作（§2.4 赋值优先级），给它们编一个本会话数就是造假——这是本文件"绝不把未知写成已知"
+     * 的既有规则，不是省略。
+     *
+     * @param {object} item
+     * @param {(key: string, params?: object) => string} t
+     * @param {{window: object, current: object}|null} scope - `panelScope()` 的结果
+     */
+    function presenceLine(item, t, scope) {
+      if (item === null || typeof item !== 'object') return null
+      if (!isNum(item.calls)) return null
+      if (item.category !== 'tools' && item.category !== 'mcp') return null
+      var context = scope !== null && typeof scope === 'object' ? scope : null
+      var win = context !== null && context.window !== null && typeof context.window === 'object'
+        ? context.window : null
+      var inWindow = context !== null && context.current !== null && typeof context.current === 'object'
+        ? context.current.inWindow === true : false
+      var scanned = win !== null && isNum(win.scanned) ? formatInt(win.scanned) : t('cl.unknown')
+      var sessionFigure
+      if (isNum(item.currentSessionCalls)) {
+        /* 窗口总调用与本会话调用**并列**呈现，各自带标签，不做任何加减。 */
+        sessionFigure = t('cl.currentSessionCalls') + ' ' + formatInt(item.currentSessionCalls)
+      } else {
+        /* 给不出就写"不可判定"（**绝不** 0），inWindow === false 时给出原因。 */
+        sessionFigure = t('cl.currentSessionUnknown')
+          + (inWindow ? '' : t('cl.currentSessionOutsideWindow'))
+      }
+      var coverage = isNum(item.sessionsWithCalls)
+        ? t('cl.sessionCoverage', { n: formatInt(item.sessionsWithCalls), scanned: scanned })
+        : t('cl.unknown')
+      return h('div', { key: 'v4', 'data-cl-presence-line': '', style: presenceLineStyle }, [
+        presenceBadge(presenceOf(item), t),
+        h('span', {
+          key: 'current',
+          'data-cl-current-session': isNum(item.currentSessionCalls)
+            ? formatInt(item.currentSessionCalls) : 'unavailable',
+          style: isNum(item.currentSessionCalls) ? presenceFigureStyle : presenceUnknownStyle,
+        }, sessionFigure),
+        h('span', {
+          key: 'coverage',
+          'data-cl-coverage': isNum(item.sessionsWithCalls) ? formatInt(item.sessionsWithCalls) : 'unavailable',
+          style: isNum(item.sessionsWithCalls) ? presenceFigureStyle : presenceUnknownStyle,
+        }, coverage),
+      ])
+    }
+
+    /**
+     * 清单行 → canonical 条目（§5：面板不重算，只做展示映射）。
+     *
+     * `findings.zeroCall` / `findings.topPerUse` 的记录只有 `id` / `category` / `name` / `tokens`；
+     * v4 的三个数**只能**来自 `items[]`，所以按 `id` 取回 canonical 条目原样渲染。
+     * 取不到时**不猜任何新数字**：只回落到不含 v4 字段的最小形状——面板会把"本会话"如实
+     * 呈现为不可判定，而不是 0（`null` 与 `0` 是两个事实，§2.26.4 I3）。
+     */
+    function findingSource(itemById, entry, zeroCall) {
+      if (entry === null || typeof entry !== 'object') return entry
+      var index = itemById === null || typeof itemById !== 'object' ? {} : itemById
+      var source = index[entry.id]
+      if (source !== null && typeof source === 'object') return source
+      return {
+        id: entry.id,
+        category: entry.category,
+        name: entry.name,
+        tokens: entry.tokens,
+        calls: zeroCall === true ? 0 : entry.calls,
+        tokensPerCall: zeroCall === true ? null : entry.tokensPerCall,
+        zeroCall: zeroCall === true,
+        usageBasis: 'tool-calls',
+      }
+    }
+
+    /**
+     * 窗口声明行（§4.9 第 2 条）：总览段与零调用段**都**常驻，不得折叠、不得收进 tooltip。
+     * 它同时是 `findings.zeroCallBasis` 的人类可读对应物，并与 `windowBasis` 一起呈现（§5 v4 第 4 条）。
+     *
+     * @param {object} report
+     * @param {(key: string, params?: object) => string} t
+     * @param {'overview'|'block'} where - 承载位置（只影响外边距，不影响内容）
+     * @returns {Array<object>} 1–2 个节点（`sessionsOutsideWindow > 0` 时追加一行）
+     */
+    function windowScopeNodes(report, t, where) {
+      var win = windowScopeOf(report)
+      var inBlock = where === 'block'
+      var marker = inBlock ? 'zero-call' : 'overview'
+      var nodes = [
+        h('p', {
+          key: 'window-scope:' + marker,
+          'data-cl-window-scope': marker,
+          style: inBlock ? windowScopeNoteStyle : windowScopeStyle,
+        }, t('cl.windowScope', {
+          scanned: formatInt(win.scanned),
+          available: formatInt(win.available),
+          start: win.start === '' ? t('cl.unknown') : win.start,
+          end: win.end === '' ? t('cl.unknown') : win.end,
+          basis: win.basis === '' ? t('cl.unknown') : win.basis,
+        })),
+      ]
+      if (win.outside > 0) {
+        nodes.push(h('p', {
+          key: 'window-omitted:' + marker,
+          'data-cl-window-omitted': marker,
+          style: inBlock ? windowOmittedNoteStyle : windowOmittedStyle,
+        }, t('cl.windowOmitted', { n: formatInt(win.outside) })))
+      }
+      return nodes
+    }
+
+    /** 总览里的「本会话调用」节点（§4.2 第 2 段 ②）：值 + 原因 + 标识来源，绝不显示 id 本身。 */
+    function currentSessionNode(summary) {
+      return h('div', {
+        key: 'current-session',
+        'data-cl-current-session-summary': '',
+        style: currentSessionStyle,
+      }, [
+        h('span', { key: 'label', style: currentSessionLabelStyle }, summary.label),
+        h('span', {
+          key: 'value',
+          'data-cl-current-session-total': summary.unknown ? 'unavailable' : 'value',
+          style: summary.unknown ? currentSessionQuietStyle : currentSessionValueStyle,
+        }, summary.value),
+        summary.reason === null ? null : h('span', {
+          key: 'reason', 'data-cl-current-session-reason': '', style: currentSessionQuietStyle,
+        }, summary.reason),
+        h('span', {
+          key: 'basis',
+          'data-cl-current-session-basis': summary.basis,
+          style: currentSessionQuietStyle,
+        }, 'basis: ' + summary.basis),
+      ])
     }
 
     /* ══════════════════════════════════════════════════════════════════════
@@ -969,6 +1283,16 @@ window.__ModuleLoader__.load({
       width: 30, height: 30, padding: 0, background: 'transparent',
       border: '1px solid ' + TONE.border, borderRadius: 7, cursor: 'pointer', font: 'inherit',
     }
+    /* 右侧栏内版式：不绝对定位、不限高、不加阴影——栏自己滚动，内容随栏宽。 */
+    var panelSidebarStyle = {
+      width: '100%', minWidth: 0, maxWidth: '100%', color: TONE.text,
+      background: 'transparent', border: 0, borderRadius: 0, boxShadow: 'none',
+      textAlign: 'left', font: 'inherit', overflowX: 'hidden',
+    }
+    /** 栏内承载容器：占满栏高并自己滚动（弹层版高度由 panelStyle 自己管）。 */
+    var tabHostStyle = { height: '100%', minHeight: 0, overflowY: 'auto', overflowX: 'hidden', padding: '2px 10px 14px' }
+    /** 栏 chip 的标题排（图标 + 文案）：chip 自身负责排版，这里只让两者基线对齐。 */
+    var tabTitleStyle = { display: 'inline-flex', alignItems: 'center', gap: 5, minWidth: 0 }
     var panelStyle = {
       position: 'absolute', zIndex: 1000, right: 0, bottom: 'calc(100% + 12px)',
       width: 468, maxWidth: 'calc(100vw - 24px)', maxHeight: 'min(72vh, 640px)',
@@ -978,88 +1302,112 @@ window.__ModuleLoader__.load({
       textAlign: 'left', font: 'inherit',
     }
     var headStyle = { display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 10, padding: '13px 15px 0' }
-    var titleStyle = { display: 'block', color: TONE.text, fontSize: 13, fontWeight: 600 }
-    var subtitleStyle = { display: 'block', marginTop: 2, color: TONE.quiet, fontSize: 11 }
-    var headerMetaStyle = { display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 4, color: TONE.quiet, fontSize: 10.5, fontVariantNumeric: 'tabular-nums' }
+    var titleStyle = { display: 'block', color: TONE.text, fontSize: FS.s14, lineHeight: LH.s14, fontWeight: 600 }
+    var subtitleStyle = { display: 'block', marginTop: 2, color: TONE.quiet, fontSize: FS.xxs12, lineHeight: LH.xxs12 }
+    var headerMetaStyle = { display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 4, color: TONE.quiet, fontSize: FS.xxs12, lineHeight: LH.xxs12, fontVariantNumeric: 'tabular-nums' }
     var refreshStyle = {
       display: 'inline-flex', alignItems: 'center', gap: 6, padding: 0, color: TONE.blue,
-      background: 'transparent', border: 0, cursor: 'pointer', font: 'inherit', fontSize: 12, fontWeight: 500,
+      background: 'transparent', border: 0, cursor: 'pointer', font: 'inherit',
+      fontSize: FS.xs13, lineHeight: LH.xs13, fontWeight: 500,
     }
     var noticeStyle = {
       display: 'flex', alignItems: 'flex-start', gap: 8, margin: '11px 15px 0', padding: '8px 10px',
       color: TONE.red, background: TONE.raised, border: '1px solid ' + TONE.border, borderRadius: 8,
-      fontSize: 11.5, lineHeight: 1.45,
+      fontSize: FS.xs13, lineHeight: LH.xs13,
     }
-    var errorStyle = { margin: '11px 15px 0', color: TONE.red, fontSize: 11.5, lineHeight: 1.45 }
-    var emptyStyle = { margin: '0 15px', padding: '18px 0', color: TONE.muted, fontSize: 11.5, textAlign: 'center' }
+    var errorStyle = { margin: '11px 15px 0', color: TONE.red, fontSize: FS.xs13, lineHeight: LH.xs13 }
+    var emptyStyle = { margin: '0 15px', padding: '18px 0', color: TONE.muted, fontSize: FS.xs13, lineHeight: LH.xs13, textAlign: 'center' }
 
     var statsStyle = { display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: 1, margin: '12px 15px 0', background: TONE.border, border: '1px solid ' + TONE.border, borderRadius: 9, overflow: 'hidden' }
     var statStyle = { display: 'flex', flexDirection: 'column', gap: 3, padding: '9px 10px', background: TONE.canvas, minWidth: 0 }
-    var statLabelStyle = { color: TONE.quiet, fontSize: 10.5 }
+    var statLabelStyle = { color: TONE.quiet, fontSize: FS.xxs12, lineHeight: LH.xxs12 }
     var statValueStyle = { display: 'flex', alignItems: 'baseline', gap: 5, minWidth: 0 }
-    var statNumberStyle = { fontFamily: MONO, fontSize: 20, fontWeight: 500, letterSpacing: '-0.03em', lineHeight: 1.05, fontVariantNumeric: 'tabular-nums', overflow: 'hidden', textOverflow: 'ellipsis' }
-    var statUnitStyle = { color: TONE.muted, fontSize: 10.5 }
-    var statSubStyle = { color: TONE.quiet, fontSize: 10.5, lineHeight: 1.4 }
+    /* 20（总览数字）保持 l-20；行高仍是数字专用的紧排（字号未变，不涉及挤字）。 */
+    var statNumberStyle = { fontFamily: MONO, fontSize: FS.l20, fontWeight: 500, letterSpacing: '-0.03em', lineHeight: 1.05, fontVariantNumeric: 'tabular-nums', overflow: 'hidden', textOverflow: 'ellipsis' }
+    var statUnitStyle = { color: TONE.muted, fontSize: FS.xxs12, lineHeight: LH.xxs12 }
+    var statSubStyle = { color: TONE.quiet, fontSize: FS.xxs12, lineHeight: LH.xxs12 }
 
     var blockStyle = { margin: '14px 15px 0' }
     var blockHeadStyle = { display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap' }
-    var blockTitleStyle = { color: TONE.text, fontSize: 12, fontWeight: 600 }
-    var blockHintStyle = { color: TONE.quiet, fontSize: 10.5 }
-    var GRID = 'minmax(0, 1fr) 74px 76px 88px'
+    var blockTitleStyle = { color: TONE.text, fontSize: FS.xs13, lineHeight: LH.xs13, fontWeight: 600 }
+    var blockHintStyle = { color: TONE.quiet, fontSize: FS.xxs12, lineHeight: LH.xxs12 }
+    var GRID = 'minmax(0, 1fr) 76px 86px 92px'
     var columnHeadStyle = { display: 'grid', gridTemplateColumns: GRID, columnGap: 8, padding: '6px 0 3px', borderBottom: '1px solid ' + TONE.border }
-    var columnLabelStyle = { color: TONE.quiet, fontSize: 10, textAlign: 'right' }
-    var rowStyle = { display: 'grid', gridTemplateColumns: GRID, columnGap: 8, alignItems: 'center', padding: '6px 0', borderBottom: '1px solid ' + TONE.border }
+    var columnLabelStyle = { color: TONE.quiet, fontSize: FS.xxxs11, lineHeight: LH.xxxs11, textAlign: 'right' }
+    var rowWrapStyle = { padding: '6px 0', borderBottom: '1px solid ' + TONE.border }
+    var rowStyle = { display: 'grid', gridTemplateColumns: GRID, columnGap: 8, alignItems: 'center' }
     var nameCellStyle = { display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 }
-    var badgeStyle = { flex: '0 0 auto', padding: '1px 5px', borderRadius: 4, background: TONE.raised, color: TONE.muted, fontSize: 9.5, whiteSpace: 'nowrap' }
-    var itemNameStyle = { overflow: 'hidden', color: TONE.text, fontSize: 11.5, textOverflow: 'ellipsis', whiteSpace: 'nowrap' }
-    var figureStyle = { color: TONE.text, fontFamily: MONO, fontSize: 11.5, textAlign: 'right', fontVariantNumeric: 'tabular-nums' }
+    var badgeStyle = { flex: '0 0 auto', padding: '1px 5px', borderRadius: 4, background: TONE.raised, color: TONE.muted, fontSize: FS.xxxs11, lineHeight: LH.xxxs11, whiteSpace: 'nowrap' }
+    var itemNameStyle = { overflow: 'hidden', color: TONE.text, fontSize: FS.xs13, lineHeight: LH.xs13, textOverflow: 'ellipsis', whiteSpace: 'nowrap' }
+    var figureStyle = { color: TONE.text, fontFamily: MONO, fontSize: FS.xs13, lineHeight: LH.xs13, textAlign: 'right', fontVariantNumeric: 'tabular-nums' }
     /* 未知值渲染成中性灰徽标（DESIGN §4.4：不是零调用样式，也不是数字）。 */
-    var unknownFigureStyle = { justifySelf: 'end', padding: '1px 6px', border: '1px solid currentColor', borderRadius: 999, fontSize: 10, whiteSpace: 'nowrap', color: TONE.quiet }
+    var unknownFigureStyle = { justifySelf: 'end', padding: '1px 6px', border: '1px solid currentColor', borderRadius: 999, fontSize: FS.xxxs11, lineHeight: LH.xxxs11, whiteSpace: 'nowrap', color: TONE.quiet }
     var catHeadStyle = { display: 'grid', gridTemplateColumns: '12px minmax(0, 1fr) 92px 44px', columnGap: 9, alignItems: 'center', width: '100%', padding: '8px 0', color: TONE.text, background: 'transparent', border: 0, borderBottom: '1px solid ' + TONE.border, textAlign: 'left', font: 'inherit' }
-    var catNameStyle = { display: 'block', overflow: 'hidden', fontSize: 12, fontWeight: 500, textOverflow: 'ellipsis', whiteSpace: 'nowrap' }
+    var catNameStyle = { display: 'block', overflow: 'hidden', fontSize: FS.xs13, lineHeight: LH.xs13, fontWeight: 500, textOverflow: 'ellipsis', whiteSpace: 'nowrap' }
     var barTrackStyle = { display: 'block', height: 4, marginTop: 5, background: TONE.sunk, borderRadius: 2, overflow: 'hidden' }
-    var catValueStyle = { fontFamily: MONO, fontSize: 11.5, textAlign: 'right', fontVariantNumeric: 'tabular-nums' }
-    var catShareStyle = { justifySelf: 'end', color: TONE.muted, fontFamily: MONO, fontSize: 10.5, fontVariantNumeric: 'tabular-nums' }
-    var catNoteStyle = { padding: '0 0 6px 21px', color: TONE.quiet, fontSize: 10.5, lineHeight: 1.5 }
+    var catValueStyle = { fontFamily: MONO, fontSize: FS.xs13, lineHeight: LH.xs13, textAlign: 'right', fontVariantNumeric: 'tabular-nums' }
+    var catShareStyle = { justifySelf: 'end', color: TONE.muted, fontFamily: MONO, fontSize: FS.xxs12, lineHeight: LH.xxs12, fontVariantNumeric: 'tabular-nums' }
+    var catNoteStyle = { padding: '0 0 6px 21px', color: TONE.quiet, fontSize: FS.xxs12, lineHeight: LH.xxs12 }
     var detailStyle = { background: TONE.raised, borderBottom: '1px solid ' + TONE.border }
     var detailPadStyle = { padding: '0 10px' }
-    var moreStyle = { padding: '6px 10px 0', color: TONE.quiet, fontSize: 10.5, fontFamily: MONO }
+    var moreStyle = { padding: '6px 10px 0', color: TONE.quiet, fontSize: FS.xxs12, lineHeight: LH.xxs12, fontFamily: MONO }
     var footerStyle = { display: 'flex', flexDirection: 'column', gap: 4, padding: '11px 15px 12px' }
-    var evidenceStyle = { color: TONE.quiet, fontFamily: MONO, fontSize: 10, lineHeight: 1.5, wordBreak: 'break-all' }
-    var warningStyle = { color: TONE.amber, fontSize: 10.5, lineHeight: 1.5 }
-    var privacyStyle = { color: TONE.quiet, fontSize: 10.5, lineHeight: 1.5 }
+    var evidenceStyle = { color: TONE.quiet, fontFamily: MONO, fontSize: FS.xxxs11, lineHeight: LH.xxxs11, wordBreak: 'break-all' }
+    var warningStyle = { color: TONE.amber, fontSize: FS.xxs12, lineHeight: LH.xxs12 }
+    var privacyStyle = { color: TONE.quiet, fontSize: FS.xxs12, lineHeight: LH.xxs12 }
 
     /* ── v2：归属徽标 / 裁剪候选块 / 无法给出动作分节 ───────────────────────── */
-    var attributionStyle = { flex: '0 0 auto', padding: '1px 5px', borderRadius: 4, background: TONE.raised, color: TONE.muted, fontSize: 9.5, whiteSpace: 'nowrap' }
+    var attributionStyle = { flex: '0 0 auto', padding: '1px 5px', borderRadius: 4, background: TONE.raised, color: TONE.muted, fontSize: FS.xxxs11, lineHeight: LH.xxxs11, whiteSpace: 'nowrap' }
     /* §4.4：归属未知 / 低置信 —— 中性灰 + 问号（由文案自带），不用确定语气、不用琥珀/红。 */
-    var attributionUncertainStyle = { flex: '0 0 auto', padding: '1px 5px', borderRadius: 4, border: '1px dashed ' + TONE.borderStrong, color: TONE.quiet, fontSize: 9.5, whiteSpace: 'nowrap' }
-    var attributionEvidenceStyle = { padding: '0 0 4px 21px', color: TONE.quiet, fontFamily: MONO, fontSize: 10, lineHeight: 1.5, userSelect: 'text', wordBreak: 'break-all' }
-    var attributionWarnStyle = { padding: '0 0 4px 21px', color: TONE.amber, fontSize: 10.5, lineHeight: 1.5 }
+    var attributionUncertainStyle = { flex: '0 0 auto', padding: '1px 5px', borderRadius: 4, border: '1px dashed ' + TONE.borderStrong, color: TONE.quiet, fontSize: FS.xxxs11, lineHeight: LH.xxxs11, whiteSpace: 'nowrap' }
+    var attributionEvidenceStyle = { padding: '0 0 4px 21px', color: TONE.quiet, fontFamily: MONO, fontSize: FS.xxxs11, lineHeight: LH.xxxs11, userSelect: 'text', wordBreak: 'break-all' }
+    var attributionWarnStyle = { padding: '0 0 4px 21px', color: TONE.amber, fontSize: FS.xxs12, lineHeight: LH.xxs12 }
 
     var pruneRowStyle = { padding: '2px 0 7px', borderBottom: '1px solid ' + TONE.border }
     var pruneHeadStyle = { display: 'flex', flexWrap: 'wrap', alignItems: 'baseline', columnGap: 8, rowGap: 3, width: '100%', padding: '6px 0 0', color: TONE.text, background: 'transparent', border: 0, textAlign: 'left', font: 'inherit', cursor: 'pointer' }
-    var pruneUnitStyle = { color: TONE.text, fontSize: 11.5, fontWeight: 600 }
-    var pruneLineStyle = { color: TONE.muted, fontSize: 11, lineHeight: 1.5 }
-    var pruneStrongStyle = { color: TONE.text, fontSize: 11, fontWeight: 500 }
-    var pruneLowStyle = { color: TONE.amber, fontSize: 10.5 }
-    var pruneFactStyle = { padding: '1px 0 0', color: TONE.quiet, fontSize: 10.5, lineHeight: 1.5, wordBreak: 'break-all' }
+    var pruneUnitStyle = { color: TONE.text, fontSize: FS.xs13, lineHeight: LH.xs13, fontWeight: 600 }
+    var pruneLineStyle = { color: TONE.muted, fontSize: FS.xxs12, lineHeight: LH.xxs12 }
+    var pruneStrongStyle = { color: TONE.text, fontSize: FS.xxs12, lineHeight: LH.xxs12, fontWeight: 500 }
+    var pruneLowStyle = { color: TONE.amber, fontSize: FS.xxs12, lineHeight: LH.xxs12 }
+    var pruneFactStyle = { padding: '1px 0 0', color: TONE.quiet, fontSize: FS.xxs12, lineHeight: LH.xxs12, wordBreak: 'break-all' }
     var pruneDetailStyle = { marginTop: 4, padding: '4px 0 2px 10px', background: TONE.raised, borderLeft: '2px solid ' + TONE.border }
     /* §4.7 第 3 条：固定不确定性声明常驻段底（可见、不折叠、无交互）。 */
-    var caveatStyle = { margin: '8px 0 0', padding: '7px 9px', color: TONE.muted, background: TONE.raised, border: '1px solid ' + TONE.border, borderRadius: 8, fontSize: 10.5, lineHeight: 1.55 }
-    var noRecRowStyle = { padding: '5px 0', color: TONE.muted, fontSize: 11, lineHeight: 1.5, borderBottom: '1px solid ' + TONE.border }
+    var caveatStyle = { margin: '8px 0 0', padding: '7px 9px', color: TONE.muted, background: TONE.raised, border: '1px solid ' + TONE.border, borderRadius: 8, fontSize: FS.xxs12, lineHeight: LH.xxs12 }
+    var noRecRowStyle = { padding: '5px 0', color: TONE.muted, fontSize: FS.xxs12, lineHeight: LH.xxs12, borderBottom: '1px solid ' + TONE.border }
 
     /* ── v3：可隐藏候选 / 恢复路径 / 两套动作并列 ───────────────────────────
      * 配色沿用宿主主题变量；**不用** error 红暗示危害（§6 第 11 条）：未校验提示条
      * 复用 §4.7 已有的 noticeStyle（那是"需要人工确认"的中性提示，不是危险告警）。 */
     var hideRowStyle = { padding: '6px 0 8px', borderBottom: '1px solid ' + TONE.border }
     var hideHeadStyle = { display: 'flex', flexWrap: 'wrap', alignItems: 'baseline', columnGap: 8, rowGap: 3 }
-    var hideApplyStyle = { padding: '7px 0 0', color: TONE.muted, fontSize: 10.5, lineHeight: 1.5 }
-    var hideEvidenceStyle = { padding: '2px 0 0', color: TONE.quiet, fontFamily: MONO, fontSize: 10, lineHeight: 1.5, wordBreak: 'break-all', userSelect: 'text' }
-    var hideWarnStyle = { padding: '3px 0 0', color: TONE.amber, fontSize: 10.5, lineHeight: 1.5 }
+    var hideApplyStyle = { padding: '7px 0 0', color: TONE.muted, fontSize: FS.xxs12, lineHeight: LH.xxs12 }
+    var hideEvidenceStyle = { padding: '2px 0 0', color: TONE.quiet, fontFamily: MONO, fontSize: FS.xxxs11, lineHeight: LH.xxxs11, wordBreak: 'break-all', userSelect: 'text' }
+    var hideWarnStyle = { padding: '3px 0 0', color: TONE.amber, fontSize: FS.xxs12, lineHeight: LH.xxs12 }
     var hideDenyStyle = { margin: '8px 0 0', padding: '7px 9px', background: TONE.raised, border: '1px solid ' + TONE.border, borderRadius: 8 }
     var hideDenyHeadStyle = { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }
-    var hideDenyListStyle = { margin: '4px 0 0', color: TONE.text, fontFamily: MONO, fontSize: 10.5, lineHeight: 1.55, wordBreak: 'break-all', userSelect: 'text' }
-    var hideNoSumStyle = { margin: '6px 0 0', padding: '6px 8px', color: TONE.muted, background: TONE.raised, border: '1px solid ' + TONE.border, borderRadius: 8, fontSize: 10.5, lineHeight: 1.5 }
+    var hideDenyListStyle = { margin: '4px 0 0', color: TONE.text, fontFamily: MONO, fontSize: FS.xxs12, lineHeight: LH.xxs12, wordBreak: 'break-all', userSelect: 'text' }
+    var hideNoSumStyle = { margin: '6px 0 0', padding: '6px 8px', color: TONE.muted, background: TONE.raised, border: '1px solid ' + TONE.border, borderRadius: 8, fontSize: FS.xxs12, lineHeight: LH.xxs12 }
+
+    /* ── v4（R8）：窗口口径 / 本会话口径 / 三态徽标（DESIGN §4.9）──────────────
+     * 配色沿用宿主主题变量：三态里只有 `absent` 复用零调用（琥珀）样式；
+     * `historical-only` 用中性灰（**绝不**用琥珀，否则会被读成"零调用"）；
+     * `current-session` 用品牌色（中性偏正向，**不是**告警色、也不是"健康"绿）。 */
+    var windowScopeStyle = { margin: '6px 15px 0', color: TONE.quiet, fontSize: FS.xxs12, lineHeight: LH.xxs12, fontVariantNumeric: 'tabular-nums' }
+    var windowOmittedStyle = { margin: '2px 15px 0', color: TONE.amber, fontSize: FS.xxs12, lineHeight: LH.xxs12 }
+    var windowScopeNoteStyle = { margin: '6px 0 0', color: TONE.quiet, fontSize: FS.xxs12, lineHeight: LH.xxs12, fontVariantNumeric: 'tabular-nums' }
+    var windowOmittedNoteStyle = { margin: '2px 0 0', color: TONE.amber, fontSize: FS.xxs12, lineHeight: LH.xxs12 }
+    var currentSessionStyle = { display: 'flex', alignItems: 'baseline', flexWrap: 'wrap', columnGap: 8, rowGap: 2, margin: '6px 15px 0', color: TONE.text, fontSize: FS.xxs12, lineHeight: LH.xxs12 }
+    var currentSessionLabelStyle = { color: TONE.quiet, fontSize: FS.xxs12, lineHeight: LH.xxs12 }
+    var currentSessionValueStyle = { fontFamily: MONO, fontSize: FS.xs13, lineHeight: LH.xs13, fontVariantNumeric: 'tabular-nums' }
+    var currentSessionQuietStyle = { color: TONE.quiet, fontSize: FS.xxxs11, lineHeight: LH.xxxs11 }
+    var presenceLineStyle = { display: 'flex', flexWrap: 'wrap', alignItems: 'baseline', columnGap: 8, rowGap: 2, margin: '2px 0 0' }
+    var presenceFigureStyle = { color: TONE.quiet, fontSize: FS.xxxs11, lineHeight: LH.xxxs11, fontVariantNumeric: 'tabular-nums' }
+    /* 「不可判定」渲染成中性灰**徽标**（§4.4 的 v4 第 3 行）：与"本会话 0 次"的普通数字格
+     * 在视觉上就是两种东西——"不知道"不得长得像"零调用"。 */
+    var presenceUnknownStyle = { padding: '1px 6px', border: '1px solid ' + TONE.borderStrong, borderRadius: 999, color: TONE.quiet, fontSize: FS.xxxs11, lineHeight: LH.xxxs11, whiteSpace: 'nowrap' }
+    var presenceCurrentStyle = { flex: '0 0 auto', padding: '1px 5px', borderRadius: 4, background: TONE.raised, color: TONE.blue, fontSize: FS.xxxs11, lineHeight: LH.xxxs11, whiteSpace: 'nowrap' }
+    var presenceNeutralStyle = { flex: '0 0 auto', padding: '1px 5px', borderRadius: 4, background: TONE.raised, color: TONE.muted, fontSize: FS.xxxs11, lineHeight: LH.xxxs11, whiteSpace: 'nowrap' }
+    var zeroChipInlineStyle = { justifySelf: 'end', padding: '1px 6px', border: '1px solid currentColor', borderRadius: 999, fontSize: FS.xxxs11, lineHeight: LH.xxxs11, whiteSpace: 'nowrap', color: chipColor('zero') }
 
     /* ══════════════════════════════════════════════════════════════════════
      * 展示组件（全部由上面的纯映射驱动）
@@ -1088,23 +1436,29 @@ window.__ModuleLoader__.load({
       return h('span', { key: 'badge', style: badgeStyle }, label)
     }
 
-    /** 数值格：有数 → 数字；null / 非有限 → cl.unknown（**绝不** 0）。 */
-    function figure(value, t) {
-      if (isNum(value)) return h('span', { key: 'figure', style: figureStyle }, formatInt(value))
-      return h('span', { key: 'figure', style: unknownFigureStyle }, t('cl.unknown'))
+    /**
+     * 数值格：有数 → 数字；null / 非有限 → cl.unknown（**绝不** 0）。
+     * `marker`（v4）给该格一个数据标记（`tokens` / `tokens-per-call`），
+     * 让核验线能逐格断言"§4.9 第 1 条的三个数各有独立节点"，而不是对整行文本做模糊匹配。
+     */
+    function figure(value, t, marker) {
+      var tag = marker === undefined ? {} : { 'data-cl-figure': marker }
+      if (isNum(value)) return h('span', Object.assign({ key: 'figure', style: figureStyle }, tag), formatInt(value))
+      return h('span', Object.assign({ key: 'figure', style: unknownFigureStyle }, tag), t('cl.unknown'))
     }
 
-    /** 次数格：零调用 → neverCalled 徽标；未知 → unknown；正数 → 数字。 */
+    /** 次数格（窗口口径 `calls`）：零调用 → neverCalled 徽标；未知 → unknown；正数 → 数字。 */
     function callsCell(item, t) {
       var state = itemState(item)
       if (state === 'zero') {
         return h('span', {
           key: 'calls',
           'data-cl-state': 'zero',
-          style: { justifySelf: 'end', padding: '1px 6px', border: '1px solid currentColor', borderRadius: 999, fontSize: 10, whiteSpace: 'nowrap', color: chipColor('zero') },
+          'data-cl-figure': 'calls',
+          style: zeroChipInlineStyle,
         }, t('cl.neverCalled'))
       }
-      return figure(item.calls, t)
+      return figure(item.calls, t, 'calls')
     }
 
     /**
@@ -1135,27 +1489,39 @@ window.__ModuleLoader__.load({
       })
     }
 
-    /** 一行账目：名字 + 分类徽标 + 归属徽标 + 成本 + 次数 + 每次使用成本。 */
-    function ledgerRow(item, t) {
+    /**
+     * 一行账目：名字 + 分类徽标 + 归属徽标 + 成本 + 次数 + 每次使用成本。
+     *
+     * v4（§4.2 第 4 段 / §4.9 第 1 条）：次数可观测的项再补一行 v4 口径——
+     * **窗口总调用（上面那格 `calls`）· 本会话 `currentSessionCalls` · 覆盖会话数
+     * `sessionsWithCalls`** 三个数同屏，各自独立成节点、标签清晰、互不可加。
+     * 行标记 `data-cl-presence` 取三态值（拿不到时为 `unavailable`），供核验线逐行断言。
+     */
+    function ledgerRow(item, t, scope) {
       var state = itemState(item)
+      var presence = presenceOf(item)
       return h('div', {
         key: String(item.id === undefined ? item.name : item.id),
         'data-cl-row': item.category,
         'data-cl-state': state,
-        style: rowStyle,
+        'data-cl-presence': presence === null ? 'unavailable' : presence,
+        style: rowWrapStyle,
       }, [
-        h('div', { key: 'name', style: nameCellStyle }, [
-          categoryBadge(item.category, t),
-          attributionBadge(item.providedBy, t),
-          h('span', {
-            key: 'label',
-            style: itemNameStyle,
-            title: item.category === 'instructions' ? item.name : undefined,
-          }, item.category === 'instructions' ? shortPath(item.name) : item.name),
+        h('div', { key: 'grid', style: rowStyle }, [
+          h('div', { key: 'name', style: nameCellStyle }, [
+            categoryBadge(item.category, t),
+            attributionBadge(item.providedBy, t),
+            h('span', {
+              key: 'label',
+              style: itemNameStyle,
+              title: item.category === 'instructions' ? item.name : undefined,
+            }, item.category === 'instructions' ? shortPath(item.name) : item.name),
+          ]),
+          figure(item.tokens, t, 'tokens'),
+          callsCell(item, t),
+          figure(item.tokensPerCall, t, 'tokens-per-call'),
         ]),
-        figure(item.tokens, t),
-        callsCell(item, t),
-        figure(item.tokensPerCall, t),
+        presenceLine(item, t, scope),
       ])
     }
 
@@ -1169,9 +1535,14 @@ window.__ModuleLoader__.load({
       ])
     }
 
-    /** 清单块：标题 + 提示 + 列头 + 行；空清单显示 cl.empty（**不**包装成「健康」之类结论）。 */
+    /**
+     * 清单块：标题 + 提示 + 列头 + 行；空清单显示 cl.empty（**不**包装成「健康」之类结论）。
+     * `options.footer`（v4 新增，可选）渲染在段体之后：零调用段用它常驻窗口声明行
+     * （§4.2 第 3 段 / §4.9 第 2 条）——它必须是**普通节点**，不可折叠、不做 tooltip。
+     */
     function listBlock(options) {
       var t = options.t
+      var footer = Array.isArray(options.footer) ? options.footer : []
       return h('section', { key: options.id, style: blockStyle, 'data-cl-block': options.id }, [
         h('div', { key: 'head', style: blockHeadStyle }, [
           h('span', { key: 'title', style: blockTitleStyle }, options.title),
@@ -1183,6 +1554,7 @@ window.__ModuleLoader__.load({
             columnHead(t),
             options.rows.map(options.renderRow),
           ]),
+        footer,
       ])
     }
 
@@ -1467,6 +1839,9 @@ window.__ModuleLoader__.load({
       var t = typeof props.t === 'function' ? props.t : fallbackT
       var report = props.report
       var state = props.state
+      /* 承载位置（R7）：'popover'（composer 就地浮层，默认）或 'sidebar'（右侧栏 tab 正文）。
+       * 只影响外层版式与语义，**不影响**任何内容与呈现义务。 */
+      var sidebarMode = props.mode === 'sidebar'
       var expandedState = useState(null)
       var expanded = expandedState[0]
       var setExpanded = expandedState[1]
@@ -1494,6 +1869,9 @@ window.__ModuleLoader__.load({
       var hideCaveatList = useMemo(function () { return hideCaveats(t) }, [t])
       var hideRestore = useMemo(function () { return restoreLines(t) }, [t])
       var parallel = useMemo(function () { return parallelRows(report, t) }, [report, t])
+      /* v4：窗口口径 / 本会话口径（只读 scope；覆盖会话数的分母与"本会话在不在窗口内"）。 */
+      var v4Scope = useMemo(function () { return panelScope(report) }, [report])
+      var currentSession = useMemo(function () { return currentSessionSummary(report, t) }, [report, t])
       var degraded = report !== null && typeof report === 'object' && report.scope !== null
         && typeof report.scope === 'object' && report.scope.usageAvailable === false
 
@@ -1518,17 +1896,20 @@ window.__ModuleLoader__.load({
               stat.sub === null ? null : h('span', { key: 'sub', style: statSubStyle }, stat.sub),
             ])
           })),
+          /* v4（§4.2 第 2 段 ①）：窗口口径行 + 窗口外会话数，**常驻**总览段（不折叠、不进 tooltip）。 */
+          windowScopeNodes(report, t, 'overview'),
+          /* v4（§4.2 第 2 段 ② / §4.9 第 3、4 条）：本会话调用；null ⇒ 不可判定（**绝不** 0）。 */
+          currentSessionNode(currentSession),
           listBlock({
             id: 'zero-call',
             t: t,
             title: t('cl.zeroCallTitle'),
             hint: t('cl.zeroCallHint'),
             rows: degraded ? [] : zeroCall,
-            renderRow: function (item) {
-              return ledgerRow({
-                id: item.id, category: item.category, name: item.name,
-                tokens: item.tokens, calls: 0, tokensPerCall: null, zeroCall: true,
-              }, t)
+            /* v4（§4.2 第 3 段 / §4.9 第 2 条）：零调用段底部常驻窗口声明，让"零调用"有参照系。 */
+            footer: windowScopeNodes(report, t, 'block'),
+            renderRow: function (entry) {
+              return ledgerRow(findingSource(itemById, entry, true), t, v4Scope)
             },
           }),
           listBlock({
@@ -1537,12 +1918,8 @@ window.__ModuleLoader__.load({
             title: t('cl.topPerUseTitle'),
             hint: t('cl.topPerUseHint'),
             rows: degraded ? [] : topPerUse,
-            renderRow: function (item) {
-              return ledgerRow({
-                id: item.id, category: item.category, name: item.name,
-                tokens: item.tokens, calls: item.calls, tokensPerCall: item.tokensPerCall,
-                zeroCall: false, usageBasis: 'tool-calls',
-              }, t)
+            renderRow: function (entry) {
+              return ledgerRow(findingSource(itemById, entry, false), t, v4Scope)
             },
           }),
           /* ── v2 第 3 段：裁剪候选（§4.2 第 3 段 / §4.7）─────────────────────
@@ -1634,7 +2011,7 @@ window.__ModuleLoader__.load({
                       /* 明细行 + 归属补充（§4.7 第 7 条：证据路径；低置信再给「推断，可能存在误判」）。 */
                       fold.shown.map(function (item) {
                         return h('div', { key: 'detail:' + String(item.id), 'data-cl-item': String(item.id) }, [
-                          ledgerRow(item, t),
+                          ledgerRow(item, t, v4Scope),
                           attributionNoteLines(item.providedBy, t),
                         ])
                       }),
@@ -1652,10 +2029,12 @@ window.__ModuleLoader__.load({
       return h('section', {
         key: 'panel',
         id: props.id,
-        role: 'dialog',
+        /* 弹层是对话框语义；栏内是栏的一页（栏自己有 tab/region 语义），不用 dialog 冒充。 */
+        role: sidebarMode ? 'region' : 'dialog',
         'aria-label': t('cl.title'),
         'data-cl-panel': '',
-        style: panelStyle,
+        'data-cl-mode': sidebarMode ? 'sidebar' : 'popover',
+        style: sidebarMode ? panelSidebarStyle : panelStyle,
       }, [
         h('header', { key: 'head', style: headStyle }, [
           h('span', { key: 'titles' }, [
@@ -1722,12 +2101,18 @@ window.__ModuleLoader__.load({
      * composer 工具行里的控件（DESIGN §4.1）：图标触发器 + 展开浮层。
      * 打开时先拉一次；手动刷新；不在后台轮询。取数只走宿主同源路由。
      */
-    function LedgerRing(props) {
-      var t = typeof props.t === 'function' ? props.t : fallbackT
-      var sessionId = props.sessionId
-      var openState = useState(false)
-      var open = openState[0]
-      var setOpen = openState[1]
+    /**
+     * 账本数据的取数生命周期（**自定义 hook**：hook 顺序在调用它的组件里恒定）。
+     *
+     * `enabled` 是"这个承载位置现在需要数据吗"：composer 就地浮层传 `open`（打开时才拉，
+     * DESIGN §4.1 的"打开时拉取"不变），右侧栏 tab 传 `true`（挂载即拉，因为栏已经展开、
+     * 内容已经在屏幕上）。每个 session 只自动拉一次，之后靠刷新按钮；不在后台轮询。
+     *
+     * @param {string|undefined} sessionId
+     * @param {boolean} enabled
+     * @returns {{life: string, report: object|null, error: string|null, stamp: number|null, refresh: function}}
+     */
+    function useLedgerData(sessionId, enabled) {
       var lifeState = useState('idle')
       var life = lifeState[0]
       var setLife = lifeState[1]
@@ -1742,8 +2127,6 @@ window.__ModuleLoader__.load({
       var setStamp = stampState[1]
       var controllerRef = useRef(null)
       var requestedRef = useRef(null)
-      var dockRef = useRef(null)
-      var panelId = useId()
 
       var refresh = useCallback(function () {
         if (typeof sessionId !== 'string' || sessionId === '') return
@@ -1778,24 +2161,43 @@ window.__ModuleLoader__.load({
         })
       }, [sessionId])
 
-      /*
-       * 取数时机（DESIGN §4.1）：**打开时**才拉取（每个 session 只自动拉一次），
-       * 之后靠面板里的刷新按钮；关闭面板不丢弃已取到的报告；不在后台轮询。
-       */
       useEffect(function () {
-        if (!open) return undefined
+        if (enabled !== true) return undefined
         if (requestedRef.current === sessionId) return undefined
         requestedRef.current = sessionId
         refresh()
         return undefined
-      }, [open, sessionId, refresh])
+      }, [enabled, sessionId, refresh])
 
-      /* 卸载即中止在途请求。 */
+      /* 卸载（或承载位置消失）即中止在途请求。 */
       useEffect(function () {
         return function () {
           if (controllerRef.current !== null) controllerRef.current.abort()
         }
       }, [])
+
+      return { life: life, report: report, error: error, stamp: stamp, refresh: refresh }
+    }
+
+    /**
+     * composer 工具行里的控件（DESIGN §4.1 触发入口；R7 起"点我就是开右侧栏"）。
+     *
+     * 点击语义（本轮硬要求）：
+     *   1. 先问右侧栏：`openLedgerTab()` → `ctx.sidebarRight.openTab(kind)`——**同一步展开**该栏；
+     *   2. 右侧栏不可用（老宿主 / headless / 未注册成 tab 类型 / 没有在屏会话）→ 回退到
+     *      **既有的就地浮层**：控件永远不是死按钮，不抛错、也不静默什么都不做。
+     * `openLedgerTab` 由 slot 的 inject face 注入（见 apply()）；它缺席时按"不可用"处理。
+     */
+    function LedgerRing(props) {
+      var t = typeof props.t === 'function' ? props.t : fallbackT
+      var sessionId = props.sessionId
+      var openState = useState(false)
+      var open = openState[0]
+      var setOpen = openState[1]
+      var openLedgerTab = typeof props.openLedgerTab === 'function' ? props.openLedgerTab : null
+      var data = useLedgerData(sessionId, open)
+      var dockRef = useRef(null)
+      var panelId = useId()
 
       /* Escape / 点击面板外关闭（capture 阶段：被页面内容吞掉的点击也生效）。 */
       useEffect(function () {
@@ -1813,15 +2215,20 @@ window.__ModuleLoader__.load({
         }
       }, [open])
 
-      var hasZeroCall = report !== null && typeof report === 'object'
-        && findingRows(report, 'zeroCall').length > 0
-      var accent = life === 'error' ? TONE.red : hasZeroCall ? TONE.amber : TONE.muted
+      var hasZeroCall = data.report !== null && typeof data.report === 'object'
+        && findingRows(data.report, 'zeroCall').length > 0
+      var accent = data.life === 'error' ? TONE.red : hasZeroCall ? TONE.amber : TONE.muted
 
       return h('span', { ref: dockRef, 'data-context-ledger': '', style: dockStyle }, [
         h('button', {
           key: 'trigger',
           type: 'button',
-          onClick: function () { setOpen(function (value) { return !value }) },
+          'data-cl-trigger': '',
+          onClick: function () {
+            /* 右侧栏优先：它接管本次点击（同一步展开）；拿不到才就地展开浮层。 */
+            if (openLedgerTab !== null && openLedgerTab() === true) return
+            setOpen(function (value) { return !value })
+          },
           title: t('cl.hint') + ' · ' + t('cl.title'),
           'aria-label': t('cl.title'),
           'aria-expanded': open,
@@ -1837,15 +2244,44 @@ window.__ModuleLoader__.load({
            */
           ? h(PanelBoundary, { key: 'panel', t: t }, h(LedgerPanel, {
             id: panelId,
+            mode: 'popover',
             t: t,
-            report: report,
-            state: life,
-            error: error,
-            refreshedAt: stamp,
-            onRefresh: refresh,
+            report: data.report,
+            state: data.life,
+            error: data.error,
+            refreshedAt: data.stamp,
+            onRefresh: data.refresh,
           }))
           : null,
       ])
+    }
+
+    /**
+     * 右侧栏 tab 的**正文**（`sidebar.right.pane.tab`，key = tab 类型的 id）。
+     *
+     * 与 composer 浮层**共用同一个 LedgerPanel**（`mode: 'sidebar'` 只换外层版式：
+     * 不再绝对定位、不再限高，交给栏自己滚动），因此 §4.7 七条与 §4.8 的 R6 义务
+     * 在新位置**一条不减**（同一份映射、同一份词典）。
+     */
+    function LedgerTab(props) {
+      var t = typeof props.t === 'function' ? props.t : fallbackT
+      var data = useLedgerData(props.sessionId, true)
+      return h('div', { 'data-cl-tab': '', style: tabHostStyle }, h(PanelBoundary, { t: t }, h(LedgerPanel, {
+        id: 'context-ledger-tab',
+        mode: 'sidebar',
+        t: t,
+        report: data.report,
+        state: data.life,
+        error: data.error,
+        refreshedAt: data.stamp,
+        onRefresh: data.refresh,
+      })))
+    }
+
+    /** 右侧栏 tab 的**标题**（`sidebar.right.pane.tab.title`，同一个 key）：栏 chip 的文案。 */
+    function LedgerTabTitle(props) {
+      var t = typeof props.t === 'function' ? props.t : fallbackT
+      return h('span', { 'data-cl-tab-title': '', style: tabTitleStyle }, [ScaleIcon(13), t('cl.title')])
     }
 
     /* ══════════════════════════════════════════════════════════════════════
@@ -1856,10 +2292,107 @@ window.__ModuleLoader__.load({
      * 注册词典并把控件落到 composer 工具行（list 座位，不复用内置 id）。
      * @param {import('@deepseek-ai/cordis').Context} ctx
      */
+    /* ══════════════════════════════════════════════════════════════════════
+     * 右侧栏承载（R7）：tab 类型注册 + 打开入口 + 优雅降级
+     *
+     * 三条纪律：
+     *   1. `slots` + `locale` 仍是**唯一硬依赖**；`sidebarRightTabs` / `sidebarRight`
+     *      一律走延迟/可选获取，缺席时面板照旧可用（就地浮层）。
+     *   2. 任何一步（注册表、座位注册、openTab）抛错都**被吸收**并报告为"不可用"，
+     *      绝不把浏览器带下去，也绝不让控件变成死按钮。
+     *   3. 两个座位共用**同一个 key**（= 类型定义的 id）：宿主按 id 分派正文与标题。
+     * ══════════════════════════════════════════════════════════════════════ */
+
+    /** 右侧栏服务面：拿不到（老宿主 / headless / 服务被撤下 / face 不完整）时返回 null，绝不抛错。 */
+    function sidebarFaceOf(ctx) {
+      try {
+        if (ctx === null || ctx === undefined || typeof ctx.get !== 'function') return null
+        var face = ctx.get(SIDEBAR_SERVICE)
+        if (face === null || face === undefined) return null
+        return typeof face.openTab === 'function' ? face : null
+      } catch (error) {
+        return null
+      }
+    }
+
+    /**
+     * 让右侧栏在**同一步**展开账本页；失败返回 false（调用方据此回退到就地浮层）：
+     * 无服务 / kind 没有注册的类型（`openTab` 会抛）/ 没有在屏会话（控制器会抛）。
+     * 每次点击都重新取面：服务可能在 HMR 前后落座或被撤下。
+     */
+    function openLedgerTab(ctx) {
+      var face = sidebarFaceOf(ctx)
+      if (face === null) return false
+      try {
+        face.openTab.call(face, LEDGER_TAB_KIND)
+        return true
+      } catch (error) {
+        return false
+      }
+    }
+
+    /**
+     * 注册 tab 类型 + 正文座位 + 标题座位——**只在宿主提供 `sidebarRightTabs` 时**。
+     *
+     * 用 `ctx.inject([...], cb)`（延迟注入的子插件）：服务缺席时回调永不执行，本插件也不等待它，
+     * 于是老宿主 / headless 自然走"没有右侧栏"的分支（硬依赖仍只有 `slots` + `locale`）。
+     * 注册全程 fail-soft：任何一步抛错都回滚已注册的部分，并让本次注册退化为"没有 tab"。
+     *
+     * @param {object} ctx - 客户端根 context
+     * @param {(key: string, params?: object) => string} t - 绑定本命名空间的翻译（词典同源）
+     * @returns {object|null} 子插件 fiber（测试与 HMR 用）；不可用时 null
+     */
+    function registerSidebarTab(ctx, t) {
+      if (ctx === null || ctx === undefined || typeof ctx.inject !== 'function') return null
+      try {
+        return ctx.inject([SIDEBAR_TABS_SERVICE], function (native) {
+          var disposers = []
+          function own(result) { if (typeof result === 'function') disposers.push(result) }
+          function disposeAll() {
+            for (var index = disposers.length - 1; index >= 0; index--) {
+              try { disposers[index]() } catch (error) { /* 卸载失败不致命 */ }
+            }
+            disposers.length = 0
+          }
+          try {
+            /* 结构再证明一次：异版本 / 外来注册表（或没有 register）走"没有 tab"分支。 */
+            var tabs = typeof native.get === 'function' ? native.get(SIDEBAR_TABS_SERVICE) : null
+            if (tabs === null || tabs === undefined || typeof tabs.register !== 'function') return undefined
+            own(tabs.register({
+              id: LEDGER_TAB_ID,
+              kind: LEDGER_TAB_KIND,
+              /* 页类型：不申报 patterns（按 kind 打开，不认领资源地址）；priority 省略 = extension 带。 */
+              title: function () { return t('cl.title') },
+            }))
+            LEDGER_TAB_SEATS.forEach(function (seat) {
+              own(native.slots.inject(seat, function () {
+                return native.slots.register({
+                  name: seat,
+                  /* 关键：正文与标题两个座位共用同一个 key = 类型定义的 id。 */
+                  key: LEDGER_TAB_ID,
+                  locale: NS,
+                }, seat === LEDGER_TAB_SEATS[0] ? LedgerTab : LedgerTabTitle)
+              }))
+            })
+          } catch (error) {
+            disposeAll()
+            return undefined
+          }
+          return disposeAll
+        })
+      } catch (error) {
+        return null
+      }
+    }
+
     function apply(ctx) {
       ctx.effect(function () {
         return ctx.locale.register(NS, { zh: zh, en: en })
       }, 'context-ledger: dictionaries')
+
+      /* 绑定本命名空间的翻译：注册表的 title thunk 与栏内组件共用同一份词典。 */
+      var t = ctx !== null && ctx !== undefined && ctx.locale !== null && ctx.locale !== undefined
+        && typeof ctx.locale.bind === 'function' ? ctx.locale.bind(NS) : fallbackT
 
       ctx.slots.inject('conversation.input.right', function () {
         return ctx.slots.register({
@@ -1867,8 +2400,15 @@ window.__ModuleLoader__.load({
           id: 'context-ledger',
           order: 21,
           locale: NS,
+          /* 把"开右侧栏"的入口注入给控件：点它先开栏，拿不到才就地展开浮层。 */
+          inject: function () {
+            return { openLedgerTab: function () { return openLedgerTab(ctx) } }
+          },
         }, LedgerRing)
       })
+
+      /* 右侧栏 tab 类型（正文 + 标题座位）：宿主没有该注册表时回调永不执行（优雅降级的关键）。 */
+      registerSidebarTab(ctx, t)
     }
 
     var plugin = { name: 'context-ledger', inject: ['slots', 'locale'], apply: apply }
@@ -1939,6 +2479,34 @@ window.__ModuleLoader__.load({
         unitKeyOf: unitKeyOf,
         parallelRows: parallelRows,
         copyToClipboard: copyToClipboard,
+        /* v4：R8 呈现所需的纯映射（核验线直接断言，不必启动 web shell） */
+        PRESENCE_VALUES: PRESENCE_VALUES,
+        PRESENCE_TONE: PRESENCE_TONE,
+        presenceColor: presenceColor,
+        presenceOf: presenceOf,
+        presenceBadge: presenceBadge,
+        presenceLine: presenceLine,
+        windowScopeOf: windowScopeOf,
+        currentSessionOf: currentSessionOf,
+        currentSessionSummary: currentSessionSummary,
+        currentSessionNode: currentSessionNode,
+        windowScopeNodes: windowScopeNodes,
+        panelScope: panelScope,
+        findingSource: findingSource,
+        ledgerRow: ledgerRow,
+        FONT_SIZES: FS,
+        FONT_LINE_HEIGHTS: LH,
+        /* v3.1/R7：右侧栏承载（类型身份、座位、打开入口、降级判定） */
+        LEDGER_TAB_ID: LEDGER_TAB_ID,
+        LEDGER_TAB_KIND: LEDGER_TAB_KIND,
+        LEDGER_TAB_SEATS: LEDGER_TAB_SEATS,
+        SIDEBAR_SERVICE: SIDEBAR_SERVICE,
+        SIDEBAR_TABS_SERVICE: SIDEBAR_TABS_SERVICE,
+        sidebarFaceOf: sidebarFaceOf,
+        openLedgerTab: openLedgerTab,
+        registerSidebarTab: registerSidebarTab,
+        LedgerTab: LedgerTab,
+        LedgerTabTitle: LedgerTabTitle,
         LedgerPanel: LedgerPanel,
         LedgerRing: LedgerRing,
         PruneBlock: PruneBlock,

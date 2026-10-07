@@ -8,7 +8,8 @@
  */
 import test, { after } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
+import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -26,7 +27,7 @@ const WORKSPACE = '/home/u/Desktop/DSHWorkspace'
 const WORKSPACE_KEY = '--home-u-Desktop-DSHWorkspace--'
 const INSTRUCTION_TEXT = '# 工作区规则\n\n只读审计插件：不写文件、不读正文。\n'
 
-/** §2.10 冻结的工具描述（**v2 修订版**，与 DESIGN 原文逐词一致，仅折叠换行空白）。 */
+/** §2.10 冻结的工具描述（**v4 修订版**，与 DESIGN 原文逐词一致，仅折叠换行空白）。 */
 const FROZEN_DESCRIPTION =
   'Reconcile the resident cost of every injected context item against how often it is actually '
   + 'called in this workspace\'s session logs. Reports, per item: token cost, call count, '
@@ -35,6 +36,9 @@ const FROZEN_DESCRIPTION =
   + 'fact — and groups never-called items by the plugin bundle or MCP server they come from. '
   + 'Those groups are CANDIDATES for review, not uninstall advice: a tool can still be used by the '
   + 'UI, by background flows, or rarely but crucially, and model call counts cannot prove otherwise. '
+  + 'Call counts cover only the scanned window (the most recent sessions, `sessions` parameter, '
+  + 'default 20) — the report states the window bounds and how many sessions were left outside it, '
+  + 'so "0 calls" means "not called in this window", never "never used". '
   + 'Read-only: it never writes a file, never reads message content, and extracts only tool names '
   + 'and counts from session logs.'
 
@@ -114,6 +118,295 @@ function setupIsolatedHome() {
   writeFileSync(join(sessionsDir, 'sess-broken', 'session.v4.jsonl.zstd'), 'definitely-not-zstd')
   return tmpRoot
 }
+
+/**
+ * 建一个**多会话**隔离 DSH_HOME（v4：覆盖会话数 / 本会话次数 / 窗口边界的夹具）。
+ *
+ * mtime 显式设定（`utimesSync`），让"窗口 = 按 mtime 降序取前 N 个"确定可断言：
+ *   `sess-cur`（最新，可读：bash×2、read×1）
+ *   `sess-old`（次新，可读：bash×1、mcp__openviking__find×1）
+ *   `sess-broken`（最旧，zstd 损坏 ⇒ unreadable，既不计次数也不计覆盖）
+ *
+ * @returns {string} 该隔离 `DSH_HOME`
+ */
+function setupTriStateHome() {
+  const root = mkdtempSync(join(tmpdir(), 'context-ledger-tristate-'))
+  tmpRoots.push(root)
+  const sessionsDir = join(root, 'sessions', WORKSPACE_KEY)
+  const write = (sessionId, name, lines, mtimeSec) => {
+    mkdirSync(join(sessionsDir, sessionId), { recursive: true })
+    const file = join(sessionsDir, sessionId, name)
+    writeFileSync(file, lines.join('\n') + '\n')
+    utimesSync(file, mtimeSec, mtimeSec)
+  }
+  write('sess-cur', 'session.v4.jsonl', [
+    JSON.stringify({ type: 'session', data: { id: 'sess-cur' } }),
+    toolCallLine('bash'), toolCallLine('bash'), toolCallLine('read'),
+  ], 1_700_000_300)
+  write('sess-old', 'session.v4.jsonl', [
+    JSON.stringify({ type: 'session', data: { id: 'sess-old' } }),
+    toolCallLine('bash'), toolCallLine('mcp__openviking__find'),
+  ], 1_700_000_200)
+  write('sess-broken', 'session.v4.jsonl.zstd', ['definitely-not-zstd'], 1_700_000_100)
+  return root
+}
+
+/** 该隔离 home 的 deps（成本表与归属都走与其它用例相同的夹具）。 */
+function tristateDeps(root, overrides = {}) {
+  return makeDeps({
+    dshHome: root,
+    profileDir: join(root, 'no-profile'),
+    coreScopeDir: join(root, 'no-core'),
+    ...overrides,
+  })
+}
+
+test('gatherLedger · v4：三态调用口径（本会话 / 窗口总 / 覆盖会话数）与窗口边界', { skip: hostSkip }, async () => {
+  const root = setupTriStateHome()
+  const deps = tristateDeps(root)
+  const report = await host.gatherLedger(deps, {
+    cwd: WORKSPACE,
+    sessions: 20,
+    agent: { session: { id: 'sess-cur', header: { cwd: WORKSPACE } } },
+  })
+
+  // ── 窗口边界（§2.2 W1/W4/W5/W6，v4 起**不再恒为 null**）──
+  assert.equal(report.version, 4)
+  assert.equal(report.scope.sessionsAvailable, 3)
+  assert.equal(report.scope.sessionsScanned, 2) // sess-cur + sess-old
+  assert.equal(report.scope.sessionsUnreadable, 1) // sess-broken
+  assert.equal(report.scope.sessionsLimit, 20)
+  assert.equal(report.scope.sessionsOutsideWindow, 0)
+  assert.equal(
+    report.scope.sessionsAvailable,
+    report.scope.sessionsScanned + report.scope.sessionsUnreadable + report.scope.sessionsOutsideWindow,
+  )
+  assert.ok(report.scope.sessionsScanned + report.scope.sessionsUnreadable <= report.scope.sessionsLimit)
+  // 边界只来自日志文件的 mtime（文件元数据）：就是夹具设定的那两个时刻
+  assert.equal(report.scope.windowStart, new Date(1_700_000_200_000).toISOString())
+  assert.equal(report.scope.windowEnd, new Date(1_700_000_300_000).toISOString())
+  assert.equal(report.scope.windowBasis, 'session-log-mtime')
+  assert.equal(report.findings.zeroCallBasis, 'model-tool-calls-in-window')
+
+  // ── scope.currentSession（模型工具路径：agent.session.id）──
+  assert.deepEqual(report.scope.currentSession, {
+    id: 'sess-cur', basis: 'agent-session-id', inWindow: true,
+  })
+
+  const byId = new Map(report.items.map(item => [item.id, item]))
+  // bash：窗口 3 次 / 本会话 2 次 / 覆盖 2 个会话
+  assert.equal(byId.get('tools:bash').calls, 3)
+  assert.equal(byId.get('tools:bash').currentSessionCalls, 2)
+  assert.equal(byId.get('tools:bash').sessionsWithCalls, 2)
+  assert.equal(byId.get('tools:bash').callPresence, 'current-session')
+  assert.equal(byId.get('tools:bash').zeroCall, false)
+  // read：只有本会话用过 ⇒ 覆盖 1
+  assert.equal(byId.get('tools:read').calls, 1)
+  assert.equal(byId.get('tools:read').currentSessionCalls, 1)
+  assert.equal(byId.get('tools:read').sessionsWithCalls, 1)
+  assert.equal(byId.get('tools:read').callPresence, 'current-session')
+  // find：本会话没用过、sess-old 用过 ⇒ **historical-only**（不是零调用）
+  assert.equal(byId.get('mcp:mcp__openviking__find').calls, 1)
+  assert.equal(byId.get('mcp:mcp__openviking__find').currentSessionCalls, 0)
+  assert.equal(byId.get('mcp:mcp__openviking__find').sessionsWithCalls, 1)
+  assert.equal(byId.get('mcp:mcp__openviking__find').callPresence, 'historical-only')
+  assert.equal(byId.get('mcp:mcp__openviking__find').zeroCall, false)
+  // 窗口内从未调用的工具：absent（只有这一态进 zeroCall/候选）
+  assert.equal(byId.get('tools:never_called_tool').calls, 0)
+  assert.equal(byId.get('tools:never_called_tool').currentSessionCalls, 0)
+  assert.equal(byId.get('tools:never_called_tool').sessionsWithCalls, 0)
+  assert.equal(byId.get('tools:never_called_tool').callPresence, 'absent')
+  assert.equal(byId.get('tools:never_called_tool').zeroCall, true)
+  // 不可观测类：三个新字段恒 null
+  assert.equal(byId.get('skills:genui').currentSessionCalls, null)
+  assert.equal(byId.get('skills:genui').sessionsWithCalls, null)
+  assert.equal(byId.get('skills:genui').callPresence, null)
+
+  // ── totals（§2.6 / I8：Σ 逐项本会话次数）──
+  assert.equal(report.totals.currentSessionObservedCalls, 2 + 1 + 0 + 0)
+  assert.ok(report.totals.currentSessionObservedCalls <= report.totals.observedCalls)
+  assert.equal(
+    report.totals.currentSessionObservedCalls,
+    report.items.reduce((sum, item) => sum + (item.currentSessionCalls ?? 0), 0),
+  )
+  // 三态确实可区分（本会话调用过 / 仅历史会话调用过 / 窗口内从未调用）
+  const presenceOf = list => report.items.filter(item => item.callPresence === list).map(item => item.id).sort()
+  assert.deepEqual(presenceOf('current-session'), ['tools:bash', 'tools:read'])
+  assert.deepEqual(presenceOf('historical-only'), ['mcp:mcp__openviking__find'])
+  assert.equal(presenceOf('absent').includes('tools:never_called_tool'), true)
+  // historical-only 绝不进零调用 / 裁剪 / 隐藏候选三段（§4.9 第 6 条）
+  for (const [section, entries] of [['zeroCall', report.findings.zeroCall], ['prunePlan', report.findings.prunePlan]]) {
+    const names = entries.flatMap(entry => (entry.items ?? [entry]).map(item => item.name))
+    assert.equal(names.includes('mcp__openviking__find'), false, `${section} 混进了 historical-only`)
+  }
+  assert.equal(report.findings.hidePlan.some(entry => entry.name === 'mcp__openviking__find'), false)
+})
+
+test('gatherLedger · v4：本会话不在窗口内 ⇒ 如实降级为 null（**绝不**记成 0）', { skip: hostSkip }, async () => {
+  const root = setupTriStateHome()
+  const deps = tristateDeps(root)
+
+  // ① 身份可取，但该会话不在本次窗口（sessions=1 只扫最新那个 sess-cur）
+  const limited = await host.gatherLedger(deps, {
+    cwd: WORKSPACE,
+    sessions: 1,
+    agent: { session: { id: 'sess-old', header: { cwd: WORKSPACE } } },
+  })
+  assert.equal(limited.scope.sessionsScanned, 1)
+  assert.equal(limited.scope.sessionsOutsideWindow, 2) // 3 − 1 − 0
+  assert.deepEqual(limited.scope.currentSession, {
+    id: 'sess-old', basis: 'agent-session-id', inWindow: false,
+  })
+  for (const item of limited.items) {
+    // 窗口维度照常可用，但"本会话用没用"真的一次都没法看 ⇒ null（不是 0）
+    assert.equal(item.currentSessionCalls, null, item.id)
+    assert.equal(item.callPresence, null, item.id)
+  }
+  assert.equal(limited.totals.currentSessionObservedCalls, null)
+  // 窗口总量与覆盖会话数不受影响（覆盖通道来自同一次读取）
+  assert.equal(limited.items.find(item => item.name === 'bash').calls, 2)
+  assert.equal(limited.items.find(item => item.name === 'bash').sessionsWithCalls, 1)
+
+  // ② 身份完全取不到（没有 agent）⇒ `unavailable`，同样不许记成 0
+  const anonymous = await host.gatherLedger(deps, { cwd: WORKSPACE, sessions: 20 })
+  assert.deepEqual(anonymous.scope.currentSession, { id: null, basis: 'unavailable', inWindow: false })
+  assert.equal(anonymous.totals.currentSessionObservedCalls, null)
+  assert.ok(anonymous.items.every(item => item.currentSessionCalls === null))
+
+  // ③ 名字过不了护栏的"身份"（不是合法会话 id）⇒ 按取不到处理，不猜
+  const bogus = await host.gatherLedger(deps, {
+    cwd: WORKSPACE,
+    sessions: 20,
+    agent: { session: { id: 'has space and 中文', header: { cwd: WORKSPACE } } },
+  })
+  assert.deepEqual(bogus.scope.currentSession, { id: null, basis: 'unavailable', inWindow: false })
+
+  // ④ 本会话日志**不可读**（在窗口内但解压失败）⇒ 也是"给不出"，不是 0
+  const unreadable = await host.gatherLedger(deps, {
+    cwd: WORKSPACE,
+    sessions: 20,
+    agent: { session: { id: 'sess-broken', header: { cwd: WORKSPACE } } },
+  })
+  assert.equal(unreadable.scope.sessionsUnreadable, 1)
+  assert.deepEqual(unreadable.scope.currentSession, {
+    id: 'sess-broken', basis: 'agent-session-id', inWindow: false,
+  })
+  assert.equal(unreadable.totals.currentSessionObservedCalls, null)
+})
+
+test('gatherLedger · v4：覆盖会话数与窗口总量出自**同一次**读取（静态守卫 + 行为断言）', { skip: hostSkip }, async () => {
+  // 静态守卫：`index.js` 里只允许一个 `readSessionUsage(` 调用点（定义处 + 回放循环）。
+  // 若有人为"覆盖会话数"另开一条读取路径，这里必然变成 3。
+  const source = readFileSync(new URL('../index.js', import.meta.url), 'utf8')
+  assert.equal(
+    source.split('await readSessionUsage(').length - 1,
+    1,
+    'index.js 出现了第二处 readSessionUsage 调用——三态必须出自同一次读取（§3.8 第 2 条）',
+  )
+  // 行为断言：坏会话（sess-broken）既不计入窗口总量，也不计入覆盖会话数——
+  // 这证明覆盖数来自"成功回放的会话"，而不是目录列举或第二次读取。
+  const root = setupTriStateHome()
+  const report = await host.gatherLedger(tristateDeps(root), {
+    cwd: WORKSPACE,
+    sessions: 20,
+    agent: { session: { id: 'sess-cur', header: { cwd: WORKSPACE } } },
+  })
+  assert.equal(report.scope.sessionsScanned + report.scope.sessionsUnreadable, 3)
+  for (const item of report.items) {
+    if (item.sessionsWithCalls === null) continue
+    assert.ok(item.sessionsWithCalls <= report.scope.sessionsScanned, `${item.id} 覆盖数超过已回放会话数`)
+    assert.equal(item.calls > 0, item.sessionsWithCalls >= 1, `${item.id} 有调用却零覆盖`)
+  }
+})
+
+test('gatherLedger · v4：窗口大小仍由 sessions 控制且有上限', { skip: hostSkip }, async () => {
+  const root = setupTriStateHome()
+  const deps = tristateDeps(root)
+  const one = await host.gatherLedger(deps, { cwd: WORKSPACE, sessions: 1 })
+  assert.equal(one.scope.sessionsLimit, 1)
+  assert.equal(one.scope.sessionsScanned, 1)
+  assert.equal(one.scope.sessionsUnreadable, 0)
+  assert.equal(one.scope.sessionsOutsideWindow, 2)
+  const capped = await host.gatherLedger(deps, { cwd: WORKSPACE, sessions: 9999 })
+  assert.equal(capped.scope.sessionsLimit, host.MAX_SESSIONS)
+  assert.equal(capped.scope.sessionsScanned, 2)
+  assert.equal(capped.scope.sessionsUnreadable, 1)
+  assert.equal(capped.scope.sessionsOutsideWindow, 0)
+})
+
+test('HTTP 路由 · v4：?session= 解析出来的 id 必须传下去（拿不到 agent 也算 http-session-param）', { skip: hostSkip }, async () => {
+  const root = setupTriStateHome()
+  const deps = tristateDeps(root)
+  const routes = host.makeLedgerRoutes({
+    deps,
+    // 会话存在（能解析出 cwd），但 agents 服务缺席 ⇒ 拿不到 agent 对象
+    sessions: { get: id => (id === 'sess-cur' ? { header: { cwd: WORKSPACE } } : undefined) },
+  })
+  const response = fakeResponse()
+  routes[0].handler({ method: 'GET', url: `${host.LEDGER_API_PATH}?session=sess-cur&sessions=20` }, response)
+  await waitForResponse(response.state)
+  assert.equal(response.state.status, 200)
+  const body = JSON.parse(response.state.body)
+  assert.equal(body.report.version, 4)
+  // §4.1（v4）：解析成功但拿不到 agent 时**仍要**把 id 传下去
+  assert.deepEqual(body.report.scope.currentSession, {
+    id: 'sess-cur', basis: 'http-session-param', inWindow: true,
+  })
+  assert.equal(body.report.totals.currentSessionObservedCalls, 3)
+  // 同工作区、不同会话的缓存键必须互不串味（否则会读到别人的"本会话调用数"）
+  const other = fakeResponse()
+  routes[0].handler({ method: 'GET', url: `${host.LEDGER_API_PATH}?session=sess-cur&sessions=1` }, other)
+  await waitForResponse(other.state)
+  assert.deepEqual(JSON.parse(other.state.body).report.scope.currentSession, {
+    id: 'sess-cur', basis: 'http-session-param', inWindow: true,
+  })
+})
+
+test('gatherLedger · v4：既有夹具在新形状下的 null 语义（缺通道 ≠ 零）', { skip: hostSkip }, async () => {
+  // `sess-ok` 可读、`sess-broken` 不可读、调用方没给会话身份 ⇒
+  // 覆盖维度**可用**（给了数字），本会话维度**不可用**（null，不是 0）。
+  setupIsolatedHome()
+  const report = await host.gatherLedger(makeDeps(), { cwd: WORKSPACE, sessions: 20 })
+  assert.equal(report.scope.sessionsOutsideWindow, 0) // 2 − 1 − 1
+  const bash = report.items.find(item => item.id === 'tools:bash')
+  assert.equal(bash.calls, 2)
+  assert.equal(bash.sessionsWithCalls, 1) // 只有 sess-ok 调用过
+  assert.equal(bash.currentSessionCalls, null)
+  assert.equal(bash.callPresence, null)
+  assert.equal(report.totals.currentSessionObservedCalls, null)
+  const neverCalled = report.items.find(item => item.id === 'tools:never_called_tool')
+  assert.equal(neverCalled.sessionsWithCalls, 0) // 已判定、确实一个都没有
+  assert.equal(neverCalled.callPresence, null) // 但本会话判定不了
+})
+
+test('gatherLedger · v4：日志全不可读时窗口边界与三态一起降级（不产零调用、不产 0 次）', { skip: hostSkip }, async () => {
+  const root = mkdtempSync(join(tmpdir(), 'context-ledger-empty-'))
+  tmpRoots.push(root)
+  const sessionsDir = join(root, 'sessions', WORKSPACE_KEY, 'sess-only')
+  mkdirSync(sessionsDir, { recursive: true })
+  writeFileSync(join(sessionsDir, 'session.v4.jsonl.zstd'), 'definitely-not-zstd')
+  const report = await host.gatherLedger(tristateDeps(root), {
+    cwd: WORKSPACE,
+    sessions: 20,
+    agent: { session: { id: 'sess-only', header: { cwd: WORKSPACE } } },
+  })
+  assert.equal(report.scope.sessionsScanned, 0)
+  assert.equal(report.scope.windowStart, null) // W3：没有窗口就没有边界
+  assert.equal(report.scope.windowEnd, null)
+  assert.equal(report.scope.windowBasis, 'session-log-mtime') // 但口径照常声明
+  assert.equal(report.scope.sessionsOutsideWindow, 0)
+  assert.deepEqual(report.scope.currentSession, {
+    id: 'sess-only', basis: 'agent-session-id', inWindow: false,
+  })
+  assert.equal(report.findings.zeroCallBasis, 'model-tool-calls-in-window')
+  assert.equal(report.totals.currentSessionObservedCalls, null)
+  for (const item of report.items) {
+    if (item.category !== 'tools' && item.category !== 'mcp') continue
+    assert.equal(item.usageBasis, 'no-evidence')
+    assert.deepEqual([item.calls, item.currentSessionCalls, item.sessionsWithCalls, item.callPresence],
+      [null, null, null, null])
+  }
+})
 
 /** 等路由 handler 把响应写完（handler 自己拥有异步生命周期）。 */
 async function waitForResponse(state) {
@@ -235,7 +528,7 @@ test('gatherLedger：四类成本 × 真实回放 → canonical 报告', { skip:
   assert.deepEqual(Object.keys(report), [
     'tool', 'version', 'generatedAt', 'unit', 'estimator', 'cwd', 'scope', 'categories', 'items', 'findings', 'totals',
   ])
-  assert.equal(report.version, 3)
+  assert.equal(report.version, 4)
   assert.equal(report.cwd, WORKSPACE)
   assert.equal(report.scope.workspaceKey, WORKSPACE_KEY)
   assert.deepEqual(report.scope.providerScan, { packages: 0, files: 0, bytes: 0, capped: false })
@@ -481,16 +774,26 @@ test('apply：注册 context_ledger 工具并挂载可选 webServer 路由', { s
   assert.equal(outputSchema.properties.scope.additionalProperties, false)
   assert.deepEqual(Object.keys(outputSchema.properties.scope.properties), [
     'workspaceKey', 'sessionsRoot', 'sessionsAvailable', 'sessionsScanned', 'sessionsUnreadable',
-    'sessionsLimit', 'windowStart', 'windowEnd', 'linesRead', 'toolCalls', 'skillToolCalls',
+    'sessionsLimit', 'sessionsOutsideWindow', 'windowStart', 'windowEnd', 'windowBasis', 'currentSession',
+    'linesRead', 'toolCalls', 'skillToolCalls',
     'callsUnmatched', 'callsUnmatchedNames', 'namesRejected', 'usageAvailable', 'truncated', 'providerScan',
   ])
+  assert.deepEqual(Object.keys(outputSchema.properties.scope.properties.currentSession.properties),
+    ['id', 'basis', 'inWindow'])
+  assert.deepEqual(outputSchema.properties.scope.properties.currentSession.properties.basis.enum,
+    ['agent-session-id', 'http-session-param', 'unavailable'])
+  assert.equal(outputSchema.properties.scope.properties.windowBasis.const, 'session-log-mtime')
   assert.deepEqual(Object.keys(outputSchema.properties.scope.properties.providerScan.properties), [
     'packages', 'files', 'bytes', 'capped',
   ])
   assert.deepEqual(Object.keys(outputSchema.properties.items.items.properties), [
-    'id', 'category', 'name', 'tokens', 'calls', 'tokensPerCall', 'zeroCall', 'usageBasis',
+    'id', 'category', 'name', 'tokens', 'calls', 'tokensPerCall', 'zeroCall',
+    'currentSessionCalls', 'sessionsWithCalls', 'callPresence', 'usageBasis',
     'source', 'server', 'bytes', 'provider', 'loadOrder', 'providedBy',
   ])
+  assert.equal(outputSchema.properties.items.items.properties.callPresence.oneOf.length, 2)
+  assert.deepEqual(outputSchema.properties.items.items.properties.callPresence.oneOf[0].enum,
+    ['current-session', 'historical-only', 'absent'])
   const providedBySchema = outputSchema.properties.items.items.properties.providedBy
   assert.equal(providedBySchema.additionalProperties, false)
   assert.deepEqual(Object.keys(providedBySchema.properties), [
@@ -508,9 +811,11 @@ test('apply：注册 context_ledger 工具并挂载可选 webServer 路由', { s
   assert.equal(outputSchema.properties.categories.items.properties.observableUsage.type, 'boolean')
   // findings：三个清单 + 省额 + 证据边界 + 固定 3 条 noRecommendation + R6 七键（§2.5 逐行顺序）
   assert.deepEqual(Object.keys(outputSchema.properties.findings.properties), [
-    'zeroCall', 'topPerUse', 'prunePlan', 'prunePlanReclaimableTokens', 'prunePlanBasis', 'noRecommendation',
+    'zeroCall', 'topPerUse', 'prunePlan', 'prunePlanReclaimableTokens', 'prunePlanBasis', 'zeroCallBasis',
+    'noRecommendation',
     'hidePlan', 'hidePlanTokens', 'hidePlanUnits', 'hidePlanBasis', 'hidePlanStatus', 'hideApply', 'hidePlanCaveat',
   ])
+  assert.equal(outputSchema.properties.findings.properties.zeroCallBasis.const, 'model-tool-calls-in-window')
   const pruneEntrySchema = outputSchema.properties.findings.properties.prunePlan.items
   assert.deepEqual(Object.keys(pruneEntrySchema.properties), [
     'kind', 'target', 'factPackages', 'items', 'itemCount', 'reclaimableTokens', 'usedToolCount', 'confidence',
@@ -556,6 +861,12 @@ test('apply：注册 context_ledger 工具并挂载可选 webServer 路由', { s
   )
   assert.equal(outputSchema.properties.findings.properties.hidePlanCaveat.properties.registryHideIsTotal.const, true)
   assert.equal(outputSchema.properties.findings.properties.hidePlanBasis.const, 'model-tool-calls-only')
+  // v4：totals 新增 currentSessionObservedCalls（§2.6：可为 null 的整数）
+  assert.equal(outputSchema.properties.totals.properties.currentSessionObservedCalls.oneOf.length, 2)
+  assert.deepEqual(Object.keys(outputSchema.properties.totals.properties), [
+    'residentTokens', 'observableTokens', 'unknownUsageTokens', 'observedCalls',
+    'currentSessionObservedCalls', 'observableTokensPerCall', 'zeroCallItems', 'zeroCallTokens', 'unknownUsageItems',
+  ])
 
   assert.equal(injections.length, 1)
   assert.deepEqual(injections[0].deps, ['webServer'])
@@ -573,11 +884,36 @@ test('apply：注册 context_ledger 工具并挂载可选 webServer 路由', { s
   const report = await definition.execute({ sessions: 5 }, { agent: undefined, signal: undefined })
   assert.equal(report.tool, 'context_ledger')
   assert.equal(report.scope.sessionsLimit, 5)
+  // v4：schema 声明的键集必须与产物实测键集**逐字相等**——`additionalProperties: false` 下
+  // 漏一个键就自相矛盾（§8"下游影响"的原话）。这里机械比对，不靠人工清点。
+  assert.deepEqual(Object.keys(report), Object.keys(outputSchema.properties))
+  assert.deepEqual(Object.keys(report.scope), Object.keys(outputSchema.properties.scope.properties))
+  assert.deepEqual(Object.keys(report.scope.currentSession),
+    Object.keys(outputSchema.properties.scope.properties.currentSession.properties))
+  // 逐项：字段**顺序**必须与 §2.4 一致；可选字段（§2.4 标"可选"）允许缺席，但
+  // 声称"必需"的字段一个都不能少，且不得出现 schema 未声明的键。
+  const itemSchemaProps = outputSchema.properties.items.items.properties
+  const optionalItemKeys = new Set(['source', 'server', 'bytes', 'provider', 'loadOrder', 'providedBy'])
+  for (const item of report.items) {
+    const keys = Object.keys(item)
+    assert.deepEqual(keys, Object.keys(itemSchemaProps).filter(key => keys.includes(key)), item.id)
+    for (const key of Object.keys(itemSchemaProps)) {
+      if (optionalItemKeys.has(key)) continue
+      assert.equal(Object.hasOwn(item, key), true, `${item.id} 缺必需字段 ${key}`)
+    }
+    // `providedBy` 是**按分类**必需（§2.13 硬规则 4）：tools/mcp 必须有，其余必须省略。
+    const attributable = item.category === 'tools' || item.category === 'mcp'
+    assert.equal(Object.hasOwn(item, 'providedBy'), attributable, item.id)
+  }
+  assert.deepEqual(Object.keys(report.findings), Object.keys(outputSchema.properties.findings.properties))
+  assert.deepEqual(Object.keys(report.totals), Object.keys(outputSchema.properties.totals.properties))
   const rendered = definition.output.render({}, report)
   assert.equal(Array.isArray(rendered), true)
   assert.equal(rendered[0].type, 'text')
   assert.match(rendered[0].text, /^Context ledger: \d+ tokens resident \/ \d+ observed calls across \d+ sessions \/ /)
-  assert.match(rendered[0].text, /Never called by the model \(cost without model use\): \d+ items, \d+ tokens/)
+  /* 单复数可选：`renderLedger` 按数量词选 `1 item` / `N items`（lib/reconcile.js 的 plural()）。
+   * 这里原先写死复数，当日夹具恰为 1 个零调用项时**无端变红**（与下一行 `units?` 不一致）。 */
+  assert.match(rendered[0].text, /Never called by the model \(cost without model use\): \d+ items?, \d+ tokens/)
   assert.match(rendered[0].text, /Never-called candidates, grouped by removal unit — NOT uninstall advice: \d+ tokens in \d+ units?/)
   assert.match(rendered[0].text, /^A tool can still be used by the UI, by background flows, or rarely but crucially; verify before removing\.$/m)
   assert.match(rendered[0].text, /Not observable: instructions \d+ tokens \(always-on\)/)
@@ -597,7 +933,7 @@ test('apply：agent cwd 优先于 defaultCwd', { skip: hostSkip }, async () => {
     agent: { session: { header: { cwd: WORKSPACE } } },
     signal: undefined,
   })
-  assert.equal(report.version, 3)
+  assert.equal(report.version, 4)
   assert.equal(report.cwd, WORKSPACE)
   assert.equal(report.scope.workspaceKey, WORKSPACE_KEY)
   // apply() 会把**真实**核心作用域目录注入 deps（§2.14：用 createRequire 定位，不硬编码路径），
@@ -649,7 +985,7 @@ test('HTTP 路由：只接受 ?session=（v2 移除 ?cwd=），60s 缓存、405�
   const body = JSON.parse(first.state.body)
   assert.equal(body.ok, true)
   assert.equal(body.report.tool, 'context_ledger')
-  assert.equal(body.report.version, 3)
+  assert.equal(body.report.version, 4)
   assert.equal(body.report.scope.workspaceKey, WORKSPACE_KEY)
   assert.equal(count(), 1)
 
@@ -684,8 +1020,20 @@ after(() => {
 // R6 宿主侧：接口探测（三态）、agent 作用域施加、opt-in 开关与 gatherLedger 接线
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** 假 tools 服务：可控地暴露 restrict / view / restrictableNames。 */
-function makeFakeTools({ restrictableNames = null, hasRestrict = true, hasView = true, onRestrict = null } = {}) {
+/**
+ * 假 tools 服务：镜像**宿主真实返回类型**（t18/B1 的通用修法）。
+ *
+ * 宿主 `view(scope)` 的真实形状（`dsh-tools/lib/index.js:2963-2985`）是
+ * `{ visible: Map, knownNames: Set, restrictableNames: Set }`——**名字集合是 `Set`，不是数组**。
+ * 因此本夹具默认把 `restrictableNames` 包成 `Set`；只有显式传 `namesType: 'array'` 时才给数组
+ * （留一条兼容性回归，因为旧替身曾这么造）。
+ *
+ * 教训（写入本轮汇报）：夹具自洽只能证明"实现与夹具一致"，证明不了"实现与宿主一致"。
+ * 故此处的形状以宿主源码为准，另有一条测试直接读宿主源码做**类型对拍**（见文件末尾）。
+ */
+function makeFakeTools({
+  restrictableNames = null, namesType = 'set', hasRestrict = true, hasView = true, onRestrict = null,
+} = {}) {
   const calls = []
   const tools = { schemas: () => SCHEMAS }
   if (hasRestrict) {
@@ -698,7 +1046,13 @@ function makeFakeTools({ restrictableNames = null, hasRestrict = true, hasView =
   if (hasView) {
     tools.view = () => {
       if (restrictableNames === null) return {}
-      return { restrictableNames }
+      const names = namesType === 'array' ? [...restrictableNames] : new Set(restrictableNames)
+      return {
+        // 与宿主同形：`visible` 是 Map、`knownNames` 与 `restrictableNames` 是 Set
+        visible: new Map([...restrictableNames].map(name => [name, { name }])),
+        knownNames: new Set(restrictableNames),
+        restrictableNames: names,
+      }
     }
   }
   return { tools, restrictCalls: calls }
@@ -879,4 +1233,133 @@ test('R6 · HTTP 路由：session 能解析出 agent 时给 prechecked，否则 
   const noAgentBody = JSON.parse(noAgent.state.body)
   assert.equal(noAgentBody.report.findings.hidePlanStatus, 'unvalidated')
   assert.deepEqual(noAgentBody.report.findings.hideApply.denyList, [])
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// t18 / B1 回归：宿主真实返回类型是 Set（不是 Array）
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** 读一次宿主源码，作为"夹具是否镜像真实类型"的对拍基准（只读，允许且被鼓励）。 */
+const DSH_TOOLS_SOURCE = (() => {
+  try {
+    return readFileSync(createRequire(import.meta.url).resolve('@deepseek-ai/dsh-tools'), 'utf8')
+  } catch {
+    return null
+  }
+})()
+const tripwireSkip = hostSkip !== false
+  ? hostSkip
+  : (DSH_TOOLS_SOURCE === null ? '@deepseek-ai/dsh-tools 不可解析：宿主类型对拍跳过' : false)
+
+test('B1 · 夹具对拍宿主源码：restrictableNames 的真实类型是 Set（默认夹具必须一致）', { skip: tripwireSkip }, () => {
+  // 一手证据（宿主源码，只读）：构造是 Set、放进 view 返回、宿主自己用 .has() 消费
+  assert.match(DSH_TOOLS_SOURCE, /const restrictableNames = (\/\* @__PURE__ \*\/ )?new Set\(\)/)
+  assert.match(DSH_TOOLS_SOURCE, /\n\t*\s*restrictableNames\s*\n?\t*\}/)
+  assert.match(DSH_TOOLS_SOURCE, /const known = this\.view\(scope\)\.restrictableNames;/)
+  assert.match(DSH_TOOLS_SOURCE, /!known\.has\(name\)/)
+  // 夹具默认必须给出同一类型（这是 B1 的通用修法：以宿主为准，而不是以实现的期待为准）
+  const byDefault = makeFakeTools({ restrictableNames: ['bash'] }).tools
+  assert.equal(byDefault.view().restrictableNames instanceof Set, true)
+  assert.equal(byDefault.view().knownNames instanceof Set, true)
+  assert.equal(byDefault.view().visible instanceof Map, true)
+  // 显式要求时仍可给数组（兼容性回归用）
+  const asArray = makeFakeTools({ restrictableNames: ['bash'], namesType: 'array' }).tools
+  assert.equal(Array.isArray(asArray.view().restrictableNames), true)
+})
+
+test('B1 · 回归：Set（宿主真机类型）⇒ prechecked + interfacePresent=true + denyList 非空', { skip: hostSkip }, async () => {
+  setupIsolatedHome()
+  // 默认夹具 = Set（宿主真实类型）；这正是修复前恒判 unsupported 的输入
+  const fake = makeFakeTools({ restrictableNames: ['never_called_tool', 'mcp__openviking__find', 'bash'] })
+  assert.equal(fake.tools.view({}).restrictableNames instanceof Set, true)
+  const probe = host.probeRestrict(fake.tools, { ctx: { tools: fake.tools } })
+  assert.equal(probe.status, 'prechecked')
+  assert.equal(probe.interfacePresent, true)
+  assert.deepEqual(probe.restrictableNames, ['never_called_tool', 'mcp__openviking__find', 'bash'])
+
+  const report = await host.gatherLedger(makeDeps({ tools: fake.tools }), {
+    cwd: WORKSPACE, sessions: 20, agent: { ctx: { tools: fake.tools } },
+  })
+  assert.equal(report.findings.hidePlanStatus, 'prechecked')
+  assert.equal(report.findings.hideApply.interfacePresent, true)
+  assert.equal(report.findings.hideApply.denyList.length > 0, true)
+  assert.deepEqual(report.findings.hideApply.denyList, ['mcp__openviking__find', 'never_called_tool'])
+  assert.deepEqual(report.findings.hideApply.skipped, [])
+  assert.equal(report.findings.hideApply.applySupported, true)
+  // 每个候选的 precheck 都是"查过了"且结论为真，不再是 null / interface-absent
+  for (const entry of report.findings.hidePlan) {
+    assert.equal(entry.precheck.status, 'prechecked')
+    assert.equal(entry.precheck.restrictable, true)
+    assert.equal(entry.precheck.reason, null)
+  }
+})
+
+test('B1 · 回归：Set 下 opt-in 施加路径真的下发名字（H2 的"施加前重新预校验"在真机类型下可达）', { skip: hostSkip }, async () => {
+  const listeners = []
+  const ctx = { on: (event, handler) => listeners.push({ event, handler }) }
+  const applied = new WeakMap()
+  setupIsolatedHome()
+  // 施加的名字必须同时是"夹具候选"（否则报告的 appliedNames 会被 denyList 过滤掉——那是设计如此）
+  const restrictable = ['never_called_tool', 'mcp__openviking__find']
+  const fake = makeFakeTools({ restrictableNames: restrictable })
+  assert.equal(host.installHideApply(ctx, {
+    // deny 里故意混进"配置写错但名字仍存在"和"名字已消失"两种情形
+    hide: { apply: true, deny: [...restrictable, 'bash', 'gone_tool'] },
+  }, applied), true)
+  const agent = { ctx: { tools: fake.tools } }
+  listeners[0].handler({ agent })
+  // 真的下发了名字：施加前用 Set 型的 restrictableNames 重新预校验，两个不可限制的名字被剔除
+  assert.deepEqual(fake.restrictCalls, [{ deny: ['mcp__openviking__find', 'never_called_tool'] }])
+  assert.deepEqual(applied.get(agent), {
+    interfacePresent: true,
+    appliedNames: ['mcp__openviking__find', 'never_called_tool'],
+    skipped: [
+      { name: 'bash', reason: 'not-in-restrictable-names' },
+      { name: 'gone_tool', reason: 'not-in-restrictable-names' },
+    ],
+  })
+  // 施加后报告如实反映：mode/appliedNames 都来自 WeakMap，而候选清单仍由 Set 型接口校验
+  const report = await host.gatherLedger(
+    makeDeps({ tools: fake.tools, appliedByAgent: applied }),
+    { cwd: WORKSPACE, sessions: 20, agent },
+  )
+  assert.equal(report.findings.hideApply.mode, 'applied-by-config')
+  assert.deepEqual(report.findings.hideApply.appliedNames, ['mcp__openviking__find', 'never_called_tool'])
+  assert.equal(report.findings.hidePlanStatus, 'prechecked')
+  assert.deepEqual(report.findings.hideApply.denyList, ['mcp__openviking__find', 'never_called_tool'])
+})
+
+test('B1 · 兼容性回归：数组型 restrictableNames 仍然可用（旧替身/旧宿主形态）', { skip: hostSkip }, async () => {
+  setupIsolatedHome()
+  const fake = makeFakeTools({ restrictableNames: ['never_called_tool', 'bash'], namesType: 'array' })
+  assert.equal(Array.isArray(fake.tools.view({}).restrictableNames), true)
+  const report = await host.gatherLedger(makeDeps({ tools: fake.tools }), {
+    cwd: WORKSPACE, sessions: 20, agent: { ctx: { tools: fake.tools } },
+  })
+  assert.equal(report.findings.hidePlanStatus, 'prechecked')
+  assert.equal(report.findings.hideApply.interfacePresent, true)
+  assert.deepEqual(report.findings.hideApply.denyList, ['never_called_tool'])
+  // 施加路径同样可达
+  const applied = new WeakMap()
+  const listeners = []
+  host.installHideApply({ on: (event, handler) => listeners.push({ event, handler }) },
+    { hide: { apply: true, deny: ['never_called_tool'] } }, applied)
+  const agent = { ctx: { tools: fake.tools } }
+  listeners[0].handler({ agent })
+  assert.deepEqual(fake.restrictCalls, [{ deny: ['never_called_tool'] }])
+  assert.deepEqual(applied.get(agent).appliedNames, ['never_called_tool'])
+})
+
+test('B1 · 非集合形状仍如实判 unsupported（Map / 普通对象 / undefined 不得被当成可用接口）', { skip: hostSkip }, () => {
+  for (const value of [undefined, null, {}, new Map([['bash', true]]), 'bash', 42]) {
+    const tools = { schemas: () => [], restrict: () => () => {}, view: () => ({ restrictableNames: value }) }
+    const probe = host.probeRestrict(tools, { id: 'agent' })
+    assert.deepEqual(probe, { status: 'unsupported', restrictableNames: null, interfacePresent: false },
+      `${String(value)} 不应被当成可用的 restrictableNames 集合`)
+  }
+  // 空 Set 是合法集合：接口可用，但所有名字都不可限制
+  const empty = { schemas: () => [], restrict: () => () => {}, view: () => ({ restrictableNames: new Set() }) }
+  assert.deepEqual(host.probeRestrict(empty, { id: 'agent' }), {
+    status: 'prechecked', restrictableNames: [], interfacePresent: true,
+  })
 })

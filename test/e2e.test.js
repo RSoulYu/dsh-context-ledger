@@ -172,6 +172,34 @@ test('E2E②：真实日志 → 真实声明面 → 零调用清单，且输出�
   assert.match(report.scope.windowStart, /^\d{4}-\d{2}-\d{2}T/)
   assert.match(report.scope.windowEnd, /^\d{4}-\d{2}-\d{2}T/)
 
+  // ── v4（R8）：窗口边界显式化（W1/W4/W5/W6）──
+  assert.equal(report.scope.windowBasis, 'session-log-mtime')
+  assert.ok(report.scope.windowStart <= report.scope.windowEnd) // W2
+  assert.equal(
+    report.scope.sessionsAvailable,
+    report.scope.sessionsScanned + report.scope.sessionsUnreadable + report.scope.sessionsOutsideWindow,
+  ) // W4
+  assert.ok(report.scope.sessionsScanned + report.scope.sessionsUnreadable <= report.scope.sessionsLimit) // W5
+  assert.equal(report.findings.zeroCallBasis, 'model-tool-calls-in-window') // I10
+
+  // ── v4：三态在真机数据上的恒等式（I1–I3/I5/I6/I7；这里没传 agent ⇒ 本会话不可判定）──
+  assert.deepEqual(report.scope.currentSession, { id: null, basis: 'unavailable', inWindow: false })
+  assert.equal(report.totals.currentSessionObservedCalls, null) // 给不出 ≠ 0
+  for (const item of report.items) {
+    assert.equal(item.currentSessionCalls, null, `${item.id} 本会话不可判定却给了数字`)
+    assert.equal(item.callPresence, null, `${item.id} 本会话不可判定却给了三态`)
+    if (item.calls === null) {
+      assert.equal(item.sessionsWithCalls, null, `${item.id} 不可观测却给了覆盖会话数`)
+      continue
+    }
+    // I6：覆盖会话数由**同一次回放**按会话分组得到（分母 = sessionsScanned）
+    assert.ok(item.sessionsWithCalls <= report.scope.sessionsScanned, `${item.id} 覆盖数越界`)
+    assert.equal(item.calls > 0, item.sessionsWithCalls >= 1, `${item.id} I6 前半段`)
+    assert.equal(item.calls === 0, item.sessionsWithCalls === 0, `${item.id} I6 后半段`)
+  }
+  // 真机数据里三态的两态必然出现（本会话不可判定 ⇒ absent 由 zeroCall 反推，见 I7 的窗口侧）
+  assert.ok(report.items.some(item => item.sessionsWithCalls > 0), '真机数据应有跨会话复用的工具')
+
   // 恒等式在真实数据上仍成立
   const sumCalls = report.items.reduce((sum, item) => sum + (item.calls ?? 0), 0)
   assert.equal(report.scope.toolCalls, sumCalls + report.scope.callsUnmatched + report.scope.namesRejected)
@@ -284,7 +312,7 @@ test('E2E②：真实日志 → 真实声明面 → 零调用清单，且输出�
   }
   // ── R6（v3）：真机隐藏候选 ──
   const hideFindings = report.findings
-  assert.equal(report.version, 3)
+  assert.equal(report.version, 4)
   assert.equal(hideFindings.hidePlanBasis, 'model-tool-calls-only')
   // H1/H2/H3：可隐藏 token = 全部零调用工具的自身 token 之和
   assert.equal(hideFindings.hidePlanTokens, hideFindings.hidePlan.reduce((sum, entry) => sum + entry.tokens, 0))

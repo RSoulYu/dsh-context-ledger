@@ -86,6 +86,41 @@ function exampleCallsByName() {
   }
 }
 
+/**
+ * §2.9 的**覆盖会话数**通道（§7.1 规则 5：v4 新增，唯一来源是它）。
+ *
+ * 数字取自 §2.9 的逐项 `sessionsWithCalls`（`bash` 12 / `find` 5 / `context_ledger` 2 /
+ * `claim_task` 2 / `read` 3）；未列出的名字 ⇒ 0（= "已判定、确实一个都没有"）。
+ */
+function exampleSessionCoverage() {
+  return {
+    bash: 12,
+    read: 3,
+    mcp__openviking__find: 5,
+    agent_teams_claim_task: 2,
+    context_ledger: 2,
+  }
+}
+
+/**
+ * §2.9 的**本会话调用数**通道（§7.1 规则 5）。
+ *
+ * 这是 `scope.currentSession.id` 那一个会话里的次数；合计 = §2.9 的
+ * `totals.currentSessionObservedCalls = 47`（41 + 3 + 2 + 1 + 0）。
+ */
+function exampleCurrentSessionCalls() {
+  return {
+    bash: 41,
+    read: 1,
+    mcp__openviking__find: 3,
+    agent_teams_claim_task: 0,
+    context_ledger: 2,
+  }
+}
+
+/** §2.9 的会话身份（v4）。 */
+const EXAMPLE_SESSION_ID = '1f0a2b3c-4d5e-6f70-8192-a3b4c5d6e7f8'
+
 /** §2.9 的 `providedBy`（11 个 tools/mcp 项各一条）+ 两个事实包的卸载单元。 */
 function exampleProvenance() {
   const staticScan = (kind, name, evidenceFile) => ({
@@ -136,10 +171,15 @@ function exampleScope() {
     sessionsRoot: EXAMPLE_SESSIONS_ROOT,
     sessionsAvailable: 41,
     sessionsScanned: 20,
-    sessionsUnreadable: 1,
+    // v4：为满足 W5（`scanned + unreadable ≤ limit`，即 20 + 0 ≤ 20）由 1 改为 0；
+    // 并新增 sessionsOutsideWindow = 41 − 20 − 0 = 21 使 W4 成立（交接 3 的合成数据自洽修正）。
+    sessionsUnreadable: 0,
     sessionsLimit: 20,
+    sessionsOutsideWindow: 21,
     windowStart: '2026-09-30T00:12:44.001Z',
     windowEnd: '2026-10-07T02:38:19.774Z',
+    windowBasis: 'session-log-mtime',
+    currentSession: { id: EXAMPLE_SESSION_ID, basis: 'agent-session-id', inWindow: true },
     linesRead: 41233,
     toolCalls: 141,
     skillToolCalls: 9,
@@ -155,6 +195,8 @@ function exampleReport() {
     sessionsRoot: EXAMPLE_SESSIONS_ROOT,
     scope: exampleScope(),
     callsByName: exampleCallsByName(),
+    sessionCoverage: exampleSessionCoverage(),
+    currentSessionCallsByName: exampleCurrentSessionCalls(),
     provenance: exampleProvenance(),
     items: exampleItems(),
   })
@@ -166,7 +208,7 @@ test('黄金样例：DESIGN §2.9 的统计恒等式逐条成立', () => {
   const sumCalls = report.items.reduce((sum, item) => sum + (item.calls ?? 0), 0)
 
   assert.equal(report.tool, 'context_ledger')
-  assert.equal(report.version, 3)
+  assert.equal(report.version, 4)
   assert.equal(report.unit, 'token')
   assert.equal(report.estimator, 'heuristic-v1')
   assert.equal(report.cwd, EXAMPLE_CWD)
@@ -230,6 +272,96 @@ test('黄金样例：DESIGN §2.9 的统计恒等式逐条成立', () => {
     'skills:openviking-skills',
     'skills:ov-experience-memory',
   ])
+})
+
+test('黄金样例：DESIGN §2.9 的 v4 断言（窗口不变量 W1–W6 与三态 I1–I11）', () => {
+  const report = exampleReport()
+  const scope = report.scope
+  const byName = new Map(report.items.map(item => [item.name, item]))
+  const sumCurrent = report.items.reduce((sum, item) => sum + (item.currentSessionCalls ?? 0), 0)
+
+  // v4 · version 3 → 4（新增必需字段即形状变更）
+  assert.equal(report.version, 4)
+
+  // v4 · W4/W5/W6 + W1（W2 在窗口非空时由字符串序保证）
+  assert.equal(scope.sessionsAvailable, scope.sessionsScanned + scope.sessionsUnreadable + scope.sessionsOutsideWindow)
+  assert.equal(scope.sessionsAvailable, 41)
+  assert.equal(scope.sessionsOutsideWindow, 21)
+  assert.ok(scope.sessionsScanned + scope.sessionsUnreadable <= scope.sessionsLimit)
+  assert.notEqual(scope.windowStart, null)
+  assert.notEqual(scope.windowEnd, null)
+  assert.ok(scope.windowStart <= scope.windowEnd)
+  assert.equal(scope.windowBasis, 'session-log-mtime')
+
+  // v4 · scope.currentSession（§2.2 三条硬规则）
+  assert.deepEqual(scope.currentSession, {
+    id: EXAMPLE_SESSION_ID, basis: 'agent-session-id', inWindow: true,
+  })
+  assert.match(scope.currentSession.id, /^[A-Za-z0-9_.-]{1,128}$/)
+
+  // v4 · I8/I9：本会话合计 = Σ 逐项；且 ≤ 窗口总量
+  assert.equal(report.totals.currentSessionObservedCalls, 47)
+  assert.equal(report.totals.currentSessionObservedCalls, sumCurrent)
+  assert.ok(report.totals.currentSessionObservedCalls <= report.totals.observedCalls)
+
+  // v4 · I1/I5/I6：逐项三态的取值与边界
+  for (const item of report.items) {
+    if (item.calls === null) {
+      // I2：不可观测 ⇒ 三个新字段全 null
+      assert.equal(item.currentSessionCalls, null, item.id)
+      assert.equal(item.sessionsWithCalls, null, item.id)
+      assert.equal(item.callPresence, null, item.id)
+      continue
+    }
+    assert.ok(item.currentSessionCalls <= item.calls, `${item.id} 本会话次数超过窗口总量`)
+    assert.ok(item.sessionsWithCalls <= scope.sessionsScanned, `${item.id} 覆盖会话数超过窗口`)
+    assert.equal(item.calls > 0, item.sessionsWithCalls >= 1, `${item.id} I6 前半段`)
+    assert.equal(item.calls === 0, item.sessionsWithCalls === 0, `${item.id} I6 后半段`)
+    // I1 / I7
+    assert.equal(item.callPresence === 'current-session', item.currentSessionCalls > 0, item.id)
+    assert.equal(item.zeroCall === true, item.callPresence === 'absent', item.id)
+    assert.ok(['current-session', 'historical-only', 'absent'].includes(item.callPresence), item.id)
+  }
+
+  // v4 · 三态齐全（§2.9 的自洽表：4 / 1 / 6）
+  const presence = list => report.items.filter(item => item.callPresence === list).length
+  assert.equal(presence('current-session'), 4)
+  assert.equal(presence('historical-only'), 1)
+  assert.equal(presence('absent'), 6)
+  assert.equal(presence('absent'), report.totals.zeroCallItems)
+
+  // v4 · 逐项数字与 §2.9 的示例逐字一致（代表项）
+  assert.deepEqual(
+    [byName.get('bash').calls, byName.get('bash').currentSessionCalls, byName.get('bash').sessionsWithCalls,
+      byName.get('bash').callPresence],
+    [118, 41, 12, 'current-session'],
+  )
+  assert.deepEqual(
+    [byName.get('read').calls, byName.get('read').currentSessionCalls, byName.get('read').sessionsWithCalls],
+    [4, 1, 3],
+  )
+  assert.deepEqual(
+    [byName.get('mcp__openviking__find').calls, byName.get('mcp__openviking__find').currentSessionCalls,
+      byName.get('mcp__openviking__find').sessionsWithCalls],
+    [8, 3, 5],
+  )
+  // 态 2（historical-only）：本会话 0 次、窗口内其他会话调用过 ⇒ **不进** findings.zeroCall
+  assert.equal(byName.get('agent_teams_claim_task').callPresence, 'historical-only')
+  assert.equal(byName.get('agent_teams_claim_task').currentSessionCalls, 0)
+  assert.equal(byName.get('agent_teams_claim_task').sessionsWithCalls, 2)
+  assert.equal(byName.get('agent_teams_claim_task').zeroCall, false)
+  assert.equal(report.findings.zeroCall.some(entry => entry.name === 'agent_teams_claim_task'), false)
+  // 态 3（absent）
+  assert.deepEqual(
+    [byName.get('task_board_list').currentSessionCalls, byName.get('task_board_list').sessionsWithCalls,
+      byName.get('task_board_list').callPresence, byName.get('task_board_list').zeroCall],
+    [0, 0, 'absent', true],
+  )
+
+  // v4 · I10：窗口边界声明（与 prunePlanBasis/hidePlanBasis 正交，二者都必须在场）
+  assert.equal(report.findings.zeroCallBasis, 'model-tool-calls-in-window')
+  assert.equal(report.findings.prunePlanBasis, 'model-tool-calls-only')
+  assert.equal(report.findings.hidePlanBasis, 'model-tool-calls-only')
 })
 
 test('黄金样例：providedBy 覆盖与取值约束（§2.13）', () => {
@@ -415,9 +547,11 @@ test('黄金样例：canonical 形状——顶层 11 键、项字段顺序、无
   assert.match(report.generatedAt, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/)
   assert.deepEqual(Object.keys(report.scope), [
     'workspaceKey', 'sessionsRoot', 'sessionsAvailable', 'sessionsScanned', 'sessionsUnreadable',
-    'sessionsLimit', 'windowStart', 'windowEnd', 'linesRead', 'toolCalls', 'skillToolCalls',
+    'sessionsLimit', 'sessionsOutsideWindow', 'windowStart', 'windowEnd', 'windowBasis', 'currentSession',
+    'linesRead', 'toolCalls', 'skillToolCalls',
     'callsUnmatched', 'callsUnmatchedNames', 'namesRejected', 'usageAvailable', 'truncated', 'providerScan',
   ])
+  assert.deepEqual(Object.keys(report.scope.currentSession), ['id', 'basis', 'inWindow'])
   assert.deepEqual(Object.keys(report.scope.providerScan), ['packages', 'files', 'bytes', 'capped'])
   assert.deepEqual(report.scope.providerScan, { packages: 387, files: 1593, bytes: 49380329, capped: false })
   assert.deepEqual(Object.keys(report.categories[0]), [
@@ -425,14 +559,16 @@ test('黄金样例：canonical 形状——顶层 11 键、项字段顺序、无
     'mechanismCalls', 'mechanismTokensPerCall',
   ])
   assert.deepEqual(Object.keys(report.items[0]), [
-    'id', 'category', 'name', 'tokens', 'calls', 'tokensPerCall', 'zeroCall', 'usageBasis',
+    'id', 'category', 'name', 'tokens', 'calls', 'tokensPerCall', 'zeroCall',
+    'currentSessionCalls', 'sessionsWithCalls', 'callPresence', 'usageBasis',
     'source', 'server', 'bytes', 'providedBy',
   ])
   assert.deepEqual(Object.keys(report.items[0].providedBy), [
     'kind', 'name', 'confidence', 'method', 'evidenceFile', 'candidates',
   ])
   assert.deepEqual(Object.keys(report.findings), [
-    'zeroCall', 'topPerUse', 'prunePlan', 'prunePlanReclaimableTokens', 'prunePlanBasis', 'noRecommendation',
+    'zeroCall', 'topPerUse', 'prunePlan', 'prunePlanReclaimableTokens', 'prunePlanBasis', 'zeroCallBasis',
+    'noRecommendation',
     'hidePlan', 'hidePlanTokens', 'hidePlanUnits', 'hidePlanBasis', 'hidePlanStatus', 'hideApply', 'hidePlanCaveat',
   ])
   assert.deepEqual(Object.keys(report.findings.prunePlan[0]), [
@@ -442,10 +578,15 @@ test('黄金样例：canonical 形状——顶层 11 键、项字段顺序、无
   assert.deepEqual(Object.keys(report.findings.noRecommendation[0]), ['reason', 'items', 'tokens'])
   assert.deepEqual(Object.keys(report.totals), [
     'residentTokens', 'observableTokens', 'unknownUsageTokens', 'observedCalls',
+    'currentSessionObservedCalls',
     'observableTokensPerCall', 'zeroCallItems', 'zeroCallTokens', 'unknownUsageItems',
   ])
   for (const item of report.items) {
     assert.equal(Object.hasOwn(item, 'observedCalls'), false)
+    // v4：三个新字段是必需的，逐项都必须在场（`null` 也是"在场"）
+    for (const key of ['currentSessionCalls', 'sessionsWithCalls', 'callPresence']) {
+      assert.equal(Object.hasOwn(item, key), true, `${item.id} 缺 ${key}`)
+    }
   }
 })
 
@@ -499,6 +640,287 @@ test('§7.1 规则 4：宿主传入的 scope 计数器以"输入即事实"为准
   assert.deepEqual(report.findings.zeroCall, [])
   assert.deepEqual(report.findings.prunePlan, [])
   assert.equal(report.findings.prunePlanReclaimableTokens, 0)
+})
+
+test('§7.1 规则 5/6（v4）：`{}` 与 `null` 是两个事实——缺通道绝不当成零', () => {
+  const item = { category: 'tools', name: 'bash', tokens: 10 }
+  const base = {
+    cwd: '/w',
+    scope: { sessionsScanned: 2, sessionsAvailable: 2 },
+    callsByName: { bash: 15 },
+    items: [{ ...item }],
+  }
+
+  // ① 两个通道都缺字段 ⇒ 逐项 `null`（**不得**退化为 0——`calls = 15` 帮不了它们）
+  const missing = reconcile({ ...base })
+  assert.equal(missing.items[0].calls, 15)
+  assert.equal(missing.items[0].currentSessionCalls, null)
+  assert.equal(missing.items[0].sessionsWithCalls, null)
+  assert.equal(missing.items[0].callPresence, null)
+  assert.equal(missing.totals.currentSessionObservedCalls, null)
+
+  // ② 显式 `null` = "给不出"（与缺字段同义）
+  const explicitNull = reconcile({ ...base, sessionCoverage: null, currentSessionCallsByName: null })
+  assert.equal(explicitNull.items[0].sessionsWithCalls, null)
+  assert.equal(explicitNull.items[0].currentSessionCalls, null)
+  assert.equal(explicitNull.totals.currentSessionObservedCalls, null)
+
+  // ③ `{}` = "已判定、确实一个都没有" ⇒ `0`（**这是唯一允许产出 0 的情形**）
+  const judged = reconcile({
+    ...base,
+    scope: { sessionsScanned: 2, sessionsAvailable: 2, currentSession: { id: 'sess-x', basis: 'agent-session-id', inWindow: true } },
+    sessionCoverage: {},
+    currentSessionCallsByName: {},
+  })
+  assert.equal(judged.items[0].sessionsWithCalls, 0)
+  assert.equal(judged.items[0].currentSessionCalls, 0)
+  // 本会话 0 次但窗口内有 15 次 ⇒ historical-only（**不是** absent，更不是零调用）
+  assert.equal(judged.items[0].callPresence, 'historical-only')
+  assert.equal(judged.items[0].zeroCall, false)
+  assert.equal(judged.totals.currentSessionObservedCalls, 0)
+  assert.equal(judged.items[0].tokensPerCall, Math.round(10 / 15))
+
+  // ④ 通道值与 `calls` 不一致时以通道为准（§7.1 规则 5：一个事实一个通道，不得互相反推）
+  const authoritative = reconcile({
+    ...base,
+    scope: { sessionsScanned: 2, sessionsAvailable: 2, currentSession: { id: 'sess-x', basis: 'agent-session-id', inWindow: true } },
+    sessionCoverage: { bash: 1 },
+    currentSessionCallsByName: { bash: 4 },
+  })
+  assert.equal(authoritative.items[0].sessionsWithCalls, 1) // 不是 15，也不是 sessionsScanned
+  assert.equal(authoritative.items[0].currentSessionCalls, 4)
+  assert.equal(authoritative.items[0].callPresence, 'current-session')
+})
+
+test('§2.26.2 判定表：7 行互斥且穷尽（逐行落地）', () => {
+  const item = { category: 'tools', name: 'bash', tokens: 10 }
+  const inWindow = {
+    sessionsScanned: 3,
+    sessionsAvailable: 3,
+    currentSession: { id: 'sess-x', basis: 'agent-session-id', inWindow: true },
+  }
+  const outside = {
+    sessionsScanned: 3,
+    sessionsAvailable: 3,
+    currentSession: { id: 'sess-x', basis: 'agent-session-id', inWindow: false },
+  }
+
+  // 行 1：tool-calls ∧ inWindow ∧ hit > 0 ⇒ current-session
+  const row1 = reconcile({
+    cwd: '/w', scope: inWindow, callsByName: { bash: 9 },
+    sessionCoverage: { bash: 2 }, currentSessionCallsByName: { bash: 4 }, items: [{ ...item }],
+  })
+  assert.deepEqual(
+    [row1.items[0].calls, row1.items[0].currentSessionCalls, row1.items[0].sessionsWithCalls,
+      row1.items[0].callPresence, row1.items[0].zeroCall],
+    [9, 4, 2, 'current-session', false],
+  )
+
+  // 行 2：tool-calls ∧ inWindow ∧ hit === 0 ∧ calls > 0 ⇒ historical-only（不进 zeroCall）
+  const row2 = reconcile({
+    cwd: '/w', scope: inWindow, callsByName: { bash: 4 },
+    sessionCoverage: { bash: 2 }, currentSessionCallsByName: { bash: 0 }, items: [{ ...item }],
+  })
+  assert.deepEqual(
+    [row2.items[0].calls, row2.items[0].currentSessionCalls, row2.items[0].sessionsWithCalls,
+      row2.items[0].callPresence, row2.items[0].zeroCall],
+    [4, 0, 2, 'historical-only', false],
+  )
+  assert.deepEqual(row2.findings.zeroCall, [])
+  assert.deepEqual(row2.findings.prunePlan, [])
+
+  // 行 3：tool-calls ∧ inWindow ∧ calls === 0 ⇒ absent（唯一进 zeroCall 的态）
+  const row3 = reconcile({
+    cwd: '/w', scope: inWindow, callsByName: {},
+    sessionCoverage: {}, currentSessionCallsByName: {}, items: [{ ...item }],
+  })
+  assert.deepEqual(
+    [row3.items[0].calls, row3.items[0].currentSessionCalls, row3.items[0].sessionsWithCalls,
+      row3.items[0].callPresence, row3.items[0].zeroCall],
+    [0, 0, 0, 'absent', true],
+  )
+  assert.deepEqual(row3.findings.zeroCall.map(entry => entry.id), ['tools:bash'])
+
+  // 行 4：inWindow === false ∧ calls > 0 ⇒ 本会话不可判定（null），覆盖会话数照常给
+  const row4 = reconcile({
+    cwd: '/w', scope: outside, callsByName: { bash: 4 },
+    sessionCoverage: { bash: 2 }, currentSessionCallsByName: { bash: 3 }, items: [{ ...item }],
+  })
+  assert.deepEqual(
+    [row4.items[0].calls, row4.items[0].currentSessionCalls, row4.items[0].sessionsWithCalls,
+      row4.items[0].callPresence, row4.items[0].zeroCall],
+    [4, null, 2, null, false],
+  )
+  // 通道即使被宿主传了，`inWindow === false` 也**不得**让它变成数字（宁少报，不假报）
+  assert.equal(row4.items[0].currentSessionCalls, null)
+  assert.equal(row4.totals.currentSessionObservedCalls, null)
+
+  // 行 5：inWindow === false ∧ calls === 0 ⇒ 覆盖 0，但本会话仍不可判定
+  const row5 = reconcile({
+    cwd: '/w', scope: outside, callsByName: {},
+    sessionCoverage: {}, currentSessionCallsByName: {}, items: [{ ...item }],
+  })
+  assert.deepEqual(
+    [row5.items[0].calls, row5.items[0].currentSessionCalls, row5.items[0].sessionsWithCalls,
+      row5.items[0].callPresence, row5.items[0].zeroCall],
+    [0, null, 0, null, true],
+  )
+
+  // 行 6：always-on / unobservable（calls === null）⇒ 三个新字段全 null
+  const row6 = reconcile({
+    cwd: '/w', scope: inWindow, callsByName: { bash: 3 },
+    sessionCoverage: { bash: 1 }, currentSessionCallsByName: { bash: 1 },
+    items: [
+      { category: 'instructions', name: '/w/AGENTS.md', tokens: 100 },
+      { category: 'skills', name: 'genui', tokens: 50 },
+    ],
+  })
+  for (const entry of row6.items) {
+    assert.equal(entry.calls, null)
+    assert.equal(entry.currentSessionCalls, null)
+    assert.equal(entry.sessionsWithCalls, null)
+    assert.equal(entry.callPresence, null)
+    assert.equal(entry.zeroCall, null)
+  }
+  assert.equal(row6.totals.currentSessionObservedCalls, null)
+
+  // 行 7：no-evidence（sessionsScanned === 0）⇒ 同样全 null，且没有候选
+  const row7 = reconcile({
+    cwd: '/w',
+    scope: { ...inWindow, sessionsScanned: 0, sessionsAvailable: 0 },
+    callsByName: { bash: 3 },
+    sessionCoverage: { bash: 1 }, currentSessionCallsByName: { bash: 1 },
+    items: [{ ...item }],
+  })
+  assert.equal(row7.scope.usageAvailable, false)
+  assert.equal(row7.items[0].usageBasis, 'no-evidence')
+  assert.deepEqual(
+    [row7.items[0].currentSessionCalls, row7.items[0].sessionsWithCalls, row7.items[0].callPresence],
+    [null, null, null],
+  )
+  assert.deepEqual(row7.findings.zeroCall, [])
+  assert.equal(row7.totals.currentSessionObservedCalls, null)
+})
+
+test('§7.1 规则 7（v4）：`scope.currentSession` 缺省填充、三条一致性与护栏', () => {
+  const item = { category: 'tools', name: 'bash', tokens: 10 }
+
+  // ① 缺字段 ⇒ 补 `{ id: null, basis: "unavailable", inWindow: false }`（**缺省填充**）
+  const filled = reconcile({ cwd: '/w', scope: { sessionsScanned: 1 }, callsByName: { bash: 2 }, items: [{ ...item }] })
+  assert.deepEqual(filled.scope.currentSession, { id: null, basis: 'unavailable', inWindow: false })
+  assert.equal(filled.items[0].currentSessionCalls, null)
+
+  // ② 宿主给了就原样透传（不得重写窗口/身份计数器）
+  const passthrough = reconcile({
+    cwd: '/w',
+    scope: { sessionsScanned: 1, currentSession: { id: 'sess-a', basis: 'agent-session-id', inWindow: true } },
+    callsByName: { bash: 2 },
+    currentSessionCallsByName: { bash: 2 },
+    items: [{ ...item }],
+  })
+  assert.deepEqual(passthrough.scope.currentSession, { id: 'sess-a', basis: 'agent-session-id', inWindow: true })
+  assert.equal(passthrough.items[0].currentSessionCalls, 2)
+
+  // ③ `inWindow === true` ⟺ 本会话计数通道可用（I4）；冲突时以 null 为准，**绝不升级为 0**
+  const contradictory = reconcile({
+    cwd: '/w',
+    scope: { sessionsScanned: 1, currentSession: { id: 'sess-a', basis: 'agent-session-id', inWindow: true } },
+    callsByName: { bash: 2 },
+    items: [{ ...item }],
+  })
+  assert.equal(contradictory.scope.currentSession.inWindow, false)
+  assert.equal(contradictory.items[0].currentSessionCalls, null)
+  assert.equal(contradictory.items[0].callPresence, null)
+
+  // ④ 通道给了但没声明 `inWindow === true` ⇒ 判定不了（不是 0）
+  const channelOnly = reconcile({
+    cwd: '/w',
+    scope: { sessionsScanned: 1 },
+    callsByName: { bash: 2 },
+    currentSessionCallsByName: { bash: 2 },
+    items: [{ ...item }],
+  })
+  assert.equal(channelOnly.items[0].currentSessionCalls, null)
+
+  // ⑤ `id` 必须先过 `NAME_PATTERN`：不匹配按"取不到"处理（`null` + `unavailable`）
+  for (const badId of ['has space', '中文会话', 'x'.repeat(129), '']) {
+    const report = reconcile({
+      cwd: '/w',
+      scope: {
+        sessionsScanned: 1,
+        currentSession: { id: badId, basis: 'agent-session-id', inWindow: true },
+      },
+      callsByName: { bash: 2 },
+      currentSessionCallsByName: { bash: 2 },
+      items: [{ ...item }],
+    })
+    assert.deepEqual(report.scope.currentSession, { id: null, basis: 'unavailable', inWindow: false }, badId)
+    assert.equal(report.items[0].currentSessionCalls, null)
+  }
+
+  // ⑥ 来源不明的 id（basis 越域/缺失）⇒ 不猜来源，按"取不到"处理；basis 越域必被规整
+  for (const basis of [undefined, '', 'mtime-latest', 'unavailable']) {
+    const report = reconcile({
+      cwd: '/w',
+      scope: { sessionsScanned: 1, currentSession: { id: 'sess-a', basis, inWindow: true } },
+      callsByName: { bash: 2 },
+      currentSessionCallsByName: { bash: 2 },
+      items: [{ ...item }],
+    })
+    assert.deepEqual(report.scope.currentSession, { id: null, basis: 'unavailable', inWindow: false }, String(basis))
+  }
+
+  // ⑦ `basis === "unavailable"` ⟺ `id === null`（两条合法来源都必须保持成立）
+  for (const [id, basis] of [['sess-a', 'agent-session-id'], ['sess-b', 'http-session-param']]) {
+    const report = reconcile({
+      cwd: '/w',
+      scope: { sessionsScanned: 1, currentSession: { id, basis, inWindow: true } },
+      callsByName: { bash: 2 },
+      currentSessionCallsByName: { bash: 2 },
+      items: [{ ...item }],
+    })
+    assert.deepEqual(report.scope.currentSession, { id, basis, inWindow: true })
+  }
+})
+
+test('§2.2 W1–W6（v4）：窗口字段是宿主传入的事实 + 常量，缺省按 W4 补出', () => {
+  const item = { category: 'tools', name: 'bash', tokens: 10 }
+
+  // ① `windowBasis` 恒为常量（无论宿主给什么，W6 不允许别的取值）
+  const basis = reconcile({ cwd: '/w', scope: { sessionsScanned: 1, windowBasis: 'whatever' }, callsByName: {}, items: [{ ...item }] })
+  assert.equal(basis.scope.windowBasis, 'session-log-mtime')
+
+  // ② W4：缺省时按 `available − scanned − unreadable` 补出（不变量机械成立）
+  const derived = reconcile({
+    cwd: '/w',
+    scope: { sessionsScanned: 20, sessionsUnreadable: 1, sessionsAvailable: 41, sessionsLimit: 21 },
+    callsByName: {}, items: [{ ...item }],
+  })
+  assert.equal(derived.scope.sessionsOutsideWindow, 20)
+  assert.equal(
+    derived.scope.sessionsAvailable,
+    derived.scope.sessionsScanned + derived.scope.sessionsUnreadable + derived.scope.sessionsOutsideWindow,
+  )
+  assert.ok(derived.scope.sessionsScanned + derived.scope.sessionsUnreadable <= derived.scope.sessionsLimit)
+
+  // ③ 宿主给了就照抄（"输入即事实"，§7.1 规则 4/§7.2）
+  const given = reconcile({
+    cwd: '/w',
+    scope: { sessionsScanned: 20, sessionsUnreadable: 0, sessionsAvailable: 41, sessionsOutsideWindow: 21 },
+    callsByName: {}, items: [{ ...item }],
+  })
+  assert.equal(given.scope.sessionsOutsideWindow, 21)
+
+  // ④ W1/W3：`sessionsScanned === 0` 时边界为 null（降级态：没有窗口，也就没有边界）
+  const degraded = reconcile({
+    cwd: '/w',
+    scope: { sessionsScanned: 0, sessionsAvailable: 0, windowStart: null, windowEnd: null },
+    callsByName: {}, items: [{ ...item }],
+  })
+  assert.equal(degraded.scope.windowStart, null)
+  assert.equal(degraded.scope.windowEnd, null)
+  assert.equal(degraded.scope.windowBasis, 'session-log-mtime') // W3 不豁免窗口口径
+  assert.equal(degraded.findings.zeroCallBasis, 'model-tool-calls-in-window')
 })
 
 test('使用次数语义：§2.4 赋值优先级互斥且逐条落地', () => {
@@ -584,6 +1006,8 @@ test('零调用识别：calls === null 绝不当成 0，绝不进 findings.zeroC
     observableTokens: 0,
     unknownUsageTokens: 100,
     observedCalls: 0,
+    // v4：无证据 ⇒ 本会话维度也**给不出**（null，不是 0）
+    currentSessionObservedCalls: null,
     observableTokensPerCall: null,
     zeroCallItems: 0,
     zeroCallTokens: 0,
@@ -820,14 +1244,14 @@ test('scope 兜底：workspaceKey 由 cwd 现算，providerScan 缺省为零值'
 
 test('常量与标识冻结（v2）', () => {
   assert.equal(LEDGER_TOOL, 'context_ledger')
-  assert.equal(LEDGER_VERSION, 3)
+  assert.equal(LEDGER_VERSION, 4)
   assert.equal(LEDGER_UNIT, 'token')
   assert.equal(ESTIMATOR, 'heuristic-v1')
   assert.deepEqual([...CATEGORY_KEYS], ['instructions', 'skills', 'tools', 'mcp'])
 })
 
 // ─────────────────────────────────────────────────────────────────────────────
-// R6（v3）黄金样例：DESIGN §2.21 的 A1–A17 与恒等式 H1–H7
+// R6（v3）黄金样例：DESIGN §2.21 的 A1–A18 与恒等式 H1–H7
 // ─────────────────────────────────────────────────────────────────────────────
 
 const EXAMPLE_EVIDENCE = '/home/u/.dsh/profiles/web/node_modules'
@@ -979,7 +1403,7 @@ function r6GoldenReport() {
   return reconcile(r6GoldenInput())
 }
 
-test('R6 黄金样例：DESIGN §2.21 的 A1–A17 逐条成立', () => {
+test('R6 黄金样例：DESIGN §2.21 的 A1–A18 逐条成立', () => {
   const report = r6GoldenReport()
   const findings = report.findings
   const pruneTokens = findings.prunePlan.reduce((sum, entry) => sum + entry.reclaimableTokens, 0)
@@ -988,7 +1412,7 @@ test('R6 黄金样例：DESIGN §2.21 的 A1–A17 逐条成立', () => {
   const unitTokens = findings.hidePlanUnits.reduce((sum, entry) => sum + entry.tokens, 0)
   const unitTools = findings.hidePlanUnits.reduce((sum, entry) => sum + entry.toolCount, 0)
 
-  assert.equal(report.version, 3)
+  assert.equal(report.version, 4)
   assert.equal(findings.hidePlan.length, 24)
   assert.equal(findings.hidePlanTokens, 4261) // A1 / A2
   assert.equal(findings.hidePlan.reduce((sum, entry) => sum + entry.tokens, 0), 4261)
@@ -1058,6 +1482,37 @@ test('R6 黄金样例：DESIGN §2.21 的 A1–A17 逐条成立', () => {
   // A17 · items 里的零调用工具数 = hidePlan 长度 = 24
   assert.equal(report.items.filter(item => item.zeroCall === true).length, 24)
   assert.equal(findings.hidePlan.length, 24)
+
+  /* A18（v4 补入的清单点）· `nameReferencedElsewhere` 升序去重且 ≤3（§2.19）。
+   * 这个不变量住在宿主半区（lib/hide.js 的 uniqueSorted(...).slice(0, NAME_REFERENCED_LIMIT)），
+   * 因此除了在面板侧机械拦住 DESIGN 与夹具，这里还要在**实现所在的一侧**测它。 */
+  for (const entry of findings.hidePlan) {
+    const referenced = entry.registryUse.nameReferencedElsewhere
+    assert.ok(referenced.length <= 3, `${entry.name}: 弱命中必须 ≤3（§2.19）`)
+    assert.deepEqual(referenced, [...referenced].sort(), `${entry.name}: 弱命中必须升序（§2.19）`)
+    assert.deepEqual(referenced, [...new Set(referenced)], `${entry.name}: 弱命中必须去重（§2.19）`)
+  }
+  assert.deepEqual(findings.hidePlan.find(entry => entry.name === 'subagent').registryUse.nameReferencedElsewhere, [
+    `${EXAMPLE_EVIDENCE}/@linxin666/dsh-session-archive/lib/index.js`,
+    `${EXAMPLE_EVIDENCE}/@nanmicoder/dsh-agent-teams/lib/harness-compat.js`,
+  ], 'A18：示例里唯一非空项按升序落值')
+  /* 乱序 + 重复输入 ⇒ 升序去重后截断到 3（实测行为，不是照抄契约文字） */
+  const scrambled = reconcile({
+    cwd: EXAMPLE_CWD,
+    scope: { sessionsScanned: 1, toolCalls: 1, callsUnmatched: 0, namesRejected: 0, linesRead: 10 },
+    callsByName: {},
+    provenance: {
+      byName: {
+        scrambled_tool: { kind: 'core', name: null, confidence: 'high', method: 'static-scan', evidenceFile: null, candidates: [] },
+      },
+      bundleOwners: {},
+      weakEvidence: { scrambled_tool: ['/z/last.js', '/a/first.js', '/m/middle.js', '/a/first.js', '/b/second.js'] },
+    },
+    hide: { status: 'prechecked', restrictableNames: ['scrambled_tool'], mode: 'suggestion-only' },
+    items: [{ category: 'tools', name: 'scrambled_tool', tokens: 100 }],
+  })
+  assert.deepEqual(scrambled.findings.hidePlan[0].registryUse.nameReferencedElsewhere,
+    ['/a/first.js', '/b/second.js', '/m/middle.js'], 'A18：实现把乱序/重复输入排成升序去重并截断到 3')
 
   // H1–H7（§2.20）
   assert.equal(findings.hidePlanTokens, findings.hidePlan.reduce((sum, entry) => sum + entry.tokens, 0)) // H1

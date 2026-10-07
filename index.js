@@ -21,16 +21,16 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import { instructionItems, skillItems, toolItems } from './lib/cost.js'
 import {
   HIDE_MODES, HIDE_PLAN_BASIS, HIDE_PLAN_CAVEAT, PRECHECK_REASONS, PRECHECK_STATUSES,
-  REGISTRY_USE_BASIS, REGISTRY_USE_VERDICTS, RESERVED_TOOL_NAMES,
+  REGISTRY_USE_BASIS, REGISTRY_USE_VERDICTS, RESERVED_TOOL_NAMES, normalizeNameCollection,
 } from './lib/hide.js'
 import {
   NO_RECOMMENDATION_REASONS, PRUNE_KINDS, PRUNE_PLAN_BASIS,
   PROVIDED_BY_CONFIDENCE, PROVIDED_BY_KINDS, PROVIDED_BY_METHODS,
   attributeNames, scanCorpus,
 } from './lib/provide.js'
-import { FINDINGS_LIMIT, LEDGER_TOOL, LEDGER_UNIT, LEDGER_VERSION, reconcile, renderLedger } from './lib/reconcile.js'
+import { FINDINGS_LIMIT, LEDGER_TOOL, LEDGER_UNIT, LEDGER_VERSION, SESSION_LOG_MTIME_BASIS, ZERO_CALL_BASIS, CALL_PRESENCE, CURRENT_SESSION_BASES, reconcile, renderLedger } from './lib/reconcile.js'
 import { ESTIMATOR } from './lib/tokens.js'
-import { MAX_LINES_PER_SESSION, createUsageCounter, projectKey } from './lib/usage.js'
+import { MAX_LINES_PER_SESSION, createUsageCounter, isValidToolName, projectKey } from './lib/usage.js'
 
 /** 插件 id（与 `cordis.patch.yml` 的 row id 对应）。 */
 export const name = 'context-ledger'
@@ -97,6 +97,49 @@ export function clampSessions(value) {
   const n = Number(value)
   if (!Number.isFinite(n) || n <= 0) return DEFAULT_SESSIONS
   return Math.min(MAX_SESSIONS, Math.max(1, Math.round(n)))
+}
+
+/**
+ * 解析本次对账所属的会话身份（DESIGN §2.2 `scope.currentSession`）。
+ *
+ * **只允许来自运行时对象**（两条合法来源，硬规则"不得猜"）：
+ *  1. `?session=` 显式传入（HTTP 路由半区）→ `basis: "http-session-param"`；
+ *  2. `agent.session.id`（模型工具半区）→ `basis: "agent-session-id"`。
+ * 两者都取不到 → `{ id: null, basis: "unavailable" }`。
+ *
+ * **不得**用"mtime 最新的那个会话目录"顶替：用推断值会让"本会话调用数"变成假事实。
+ * `id` 还必须先过 `NAME_PATTERN`（§3.3/§3.8 第 3 条）——会话 id 是宿主运行时字符串，
+ * 不得成为绕过护栏的旁路；不匹配即按"取不到"处理。
+ *
+ * @param {{sessionId?: unknown, agent?: unknown}} options
+ * @returns {{id: string | null, basis: string}}
+ */
+export function resolveCurrentSessionId(options) {
+  const explicit = typeof options?.sessionId === 'string' && options.sessionId !== '' ? options.sessionId : null
+  const fromAgent = options?.agent?.session?.id
+  const candidate = explicit ?? (typeof fromAgent === 'string' && fromAgent !== '' ? fromAgent : null)
+  const basis = explicit !== null ? 'http-session-param' : 'agent-session-id'
+  if (candidate === null || !isValidToolName(candidate)) return { id: null, basis: 'unavailable' }
+  return { id: candidate, basis }
+}
+
+/**
+ * 把「名字 → 次数」映射写成 canonical 对象（键名升序、`defineProperty` 防原型污染）。
+ * @param {Map<string, number>} counts
+ * @returns {Record<string, number>}
+ */
+function toCountsObject(counts) {
+  /** @type {Record<string, number>} */
+  const out = {}
+  for (const name of [...counts.keys()].sort()) {
+    Object.defineProperty(out, name, {
+      value: counts.get(name) ?? 0,
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    })
+  }
+  return out
 }
 
 /**
@@ -668,6 +711,12 @@ function mergeWeakFiles(...scans) {
  * - `unvalidated`：接口在，但拿不到 agent 作用域（如 HTTP 路由所在的宿主）；
  * - `unsupported`：缺 `restrict` / 缺 `view().restrictableNames`（旧宿主）。
  *
+ * **类型以宿主源码为准（t18/B1）**：`view(scope).restrictableNames` 的真实类型是 **`Set`**
+ * （`dsh-tools/lib/index.js:2969` 构造、`:2983` 放进 view、`:2906` 用 `.has()` 消费）。
+ * 这里用 {@link normalizeNameCollection} 同时接受 `Set` 与 `Array`；把任何非集合形状
+ * （`undefined` / 普通对象 / `Map`）如实判为"拿不到集合" ⇒ `unsupported`。
+ * 曾用 `Array.isArray` 直接判定，导致真机上恒判 `unsupported`（`denyList` 恒为空）。
+ *
  * @param {any} tools - `ctx.tools`（或 `agent.ctx.tools`）
  * @param {unknown} [agent] - 目标 agent（作用域）
  * @returns {{status: string, restrictableNames: string[]|null, interfacePresent: boolean}}
@@ -683,16 +732,13 @@ export function probeRestrict(tools, agent) {
   }
   try {
     const view = tools.view(agent)
-    const names = view?.restrictableNames
-    if (!Array.isArray(names)) {
-      // 有 view 但拿不到 `restrictableNames`：旧宿主，按"接口缺失"处理（§2.23.3 第 3 行）。
+    // 宿主真机类型是 `Set`（见上）；`Array` 只在替身/历史实现里出现过，一并接受。
+    const names = normalizeNameCollection(view?.restrictableNames)
+    if (names === null) {
+      // 有 view 但拿不到 `restrictableNames` 集合：旧宿主，按"接口缺失"处理（§2.23.3 第 3 行）。
       return { status: 'unsupported', restrictableNames: null, interfacePresent: false }
     }
-    return {
-      status: 'prechecked',
-      restrictableNames: names.filter(name => typeof name === 'string'),
-      interfacePresent: true,
-    }
+    return { status: 'prechecked', restrictableNames: names, interfacePresent: true }
   } catch {
     // `view(agent)` 抛错 = 拿不到该 agent 的作用域（不是接口缺失）⇒ 未校验，不抛错。
     return { status: 'unvalidated', restrictableNames: null, interfacePresent: true }
@@ -833,9 +879,17 @@ export async function gatherLedger(deps, options) {
   const sessionsRoot = sessionsRootOf(dshHome)
   const available = listWorkspaceSessions(sessionsRoot, workspaceKey)
   const selected = available.slice(0, sessionsLimit)
+  // v4（§3.8 第 2 条）：三个投影**全部**出自下面这一次逐会话回放——
+  // 窗口总量（`counts`）/ 覆盖会话数（`coverage`）/ 本会话次数（`currentSessionCounts`）。
+  // **不得**为任何一项另开读取路径（不重新解压、不换计数函数、不 stat 以外的读盘）。
+  const identity = resolveCurrentSessionId(options)
 
   /** @type {Map<string, number>} */
   const counts = new Map()
+  /** @type {Map<string, number>} */
+  const coverage = new Map()
+  /** @type {Record<string, number> | null} */
+  let currentSessionCounts = null
   let sessionsScanned = 0
   let sessionsUnreadable = 0
   let linesRead = 0
@@ -865,23 +919,23 @@ export async function gatherLedger(deps, options) {
     truncated = truncated || usage.truncated
     for (const [toolName, count] of Object.entries(usage.callsByName)) {
       counts.set(toolName, (counts.get(toolName) ?? 0) + count)
+      coverage.set(toolName, (coverage.get(toolName) ?? 0) + 1)
     }
+    if (identity.id !== null && entry.id === identity.id) currentSessionCounts = usage.callsByName
     if (entry.mtimeMs > 0) {
       oldest = oldest === null ? entry.mtimeMs : Math.min(oldest, entry.mtimeMs)
       newest = newest === null ? entry.mtimeMs : Math.max(newest, entry.mtimeMs)
     }
   }
 
-  /** @type {Record<string, number>} */
-  const callsByName = {}
-  for (const toolName of [...counts.keys()].sort()) {
-    Object.defineProperty(callsByName, toolName, {
-      value: counts.get(toolName) ?? 0,
-      enumerable: true,
-      writable: true,
-      configurable: true,
-    })
-  }
+  const callsByName = toCountsObject(counts)
+  const inWindow = identity.id !== null && currentSessionCounts !== null
+  // §7.1 规则 6：`{}` = "已判定、确实一个都没有"（⇒ 0）；`null` = "给不出"（⇒ `null`）。
+  // 一次会话都没回放成功时，覆盖维度**没有**被判定过，因此如实传 `null`（不是 `{}`）。
+  const sessionCoverage = sessionsScanned >= 1 ? toCountsObject(coverage) : null
+  // 本会话不在窗口内（含身份未知）⇒ `null`：**绝不用 0 冒充"本会话没用过"**。
+  // `usage.callsByName` 本身已是 canonical 形状（键名升序 + `defineProperty`），直接复用。
+  const currentSessionCallsByName = inWindow ? currentSessionCounts : null
 
   // ── 3. 对账（calls / tokensPerCall / zeroCall / usageBasis 的唯一赋权点） ──
   return reconcile({
@@ -889,6 +943,8 @@ export async function gatherLedger(deps, options) {
     sessionsRoot,
     findingsLimit: FINDINGS_LIMIT,
     callsByName,
+    sessionCoverage,
+    currentSessionCallsByName,
     scope: {
       workspaceKey,
       sessionsRoot,
@@ -896,8 +952,13 @@ export async function gatherLedger(deps, options) {
       sessionsScanned,
       sessionsUnreadable,
       sessionsLimit,
+      // §2.2 W4：available = scanned + unreadable + outsideWindow（按此恒等式构造）。
+      sessionsOutsideWindow: Math.max(0, available.length - sessionsScanned - sessionsUnreadable),
       windowStart: oldest === null ? null : new Date(oldest).toISOString(),
       windowEnd: newest === null ? null : new Date(newest).toISOString(),
+      // 窗口边界**只**来自日志文件 mtime（文件系统元数据）；不读行内 `time`（§2.2 第 4 条）。
+      windowBasis: SESSION_LOG_MTIME_BASIS,
+      currentSession: { id: identity.id, basis: identity.basis, inWindow },
       linesRead,
       toolCalls,
       skillToolCalls,
@@ -958,8 +1019,10 @@ export function makeLedgerRoutes(config) {
   const cache = new Map()
   const maxCacheEntries = 32
 
-  const report = (cwd, sessions, agent) => {
-    const key = `${cwd} ${sessions}`
+  const report = (cwd, sessions, agent, sessionId) => {
+    // 缓存键必须含 sessionId：`scope.currentSession` 随会话变化，
+    // 不含它会让同工作区的另一个会话读到**别人**的"本会话调用数"（同源分歧即缺陷，§5）。
+    const key = `${cwd} ${sessions} ${sessionId ?? ''}`
     const hit = cache.get(key)
     if (hit !== undefined && Date.now() - hit.at < cacheTtlMs) return hit.promise
     if (cache.size >= maxCacheEntries) {
@@ -970,6 +1033,9 @@ export function makeLedgerRoutes(config) {
       cwd,
       sessions,
       signal: new AbortController().signal,
+      // §4.1（v4）：`?session=` 解析成功但拿不到 agent 时仍要把 id 传下去，
+      // 否则"本会话调用数"会无谓退化成不可判定。
+      sessionId,
       ...(agent !== undefined ? { agent } : {}),
     }).catch((error) => {
       cache.delete(key) // 失败不缓存，允许下次重试
@@ -1003,7 +1069,8 @@ export function makeLedgerRoutes(config) {
       const cwd = sessionCwd
       const agent = config.deps?.agents !== undefined ? config.deps.agents.get(sessionId) : undefined
       const sessions = clampSessions(parseQueryParam(url, 'sessions'))
-      report(cwd, sessions, agent).then(
+      // v4：`?session=` 是 `scope.currentSession.id` 的两个合法来源之一（§2.2/§4.1）。
+      report(cwd, sessions, agent, sessionId).then(
         value => json(res, 200, { ok: true, report: value }),
         (error) => json(res, 500, {
           ok: false,
@@ -1015,10 +1082,10 @@ export function makeLedgerRoutes(config) {
 }
 
 /**
- * `context_ledger` 工具描述（DESIGN §2.10 **v2 修订版**，冻结文本，英文，实现线照抄）。
+ * `context_ledger` 工具描述（DESIGN §2.10，**v4 修订版**，冻结文本，英文，实现线照抄）。
  *
- * 与 v1 的差别：加入归属的"启发式推断、非事实"措辞，以及候选清单的
- * "CANDIDATES for review, not uninstall advice" 措辞（§6 第 10 条的措辞红线）。
+ * 与 v2 的差别（v4）：补一句**窗口口径限定**——模型半区是"零调用候选"这句话的发出者，
+ * 不告诉它窗口口径，它会继续把"窗口内 0 次"表述成"从未使用"（§2.26 开头 / §5 第 3 条）。
  */
 const TOOL_DESCRIPTION =
   'Reconcile the resident cost of every injected context item against how often it is actually '
@@ -1028,6 +1095,9 @@ const TOOL_DESCRIPTION =
   + 'fact — and groups never-called items by the plugin bundle or MCP server they come from. '
   + 'Those groups are CANDIDATES for review, not uninstall advice: a tool can still be used by the '
   + 'UI, by background flows, or rarely but crucially, and model call counts cannot prove otherwise. '
+  + 'Call counts cover only the scanned window (the most recent sessions, `sessions` parameter, '
+  + 'default 20) — the report states the window bounds and how many sessions were left outside it, '
+  + 'so "0 calls" means "not called in this window", never "never used". '
   + 'Read-only: it never writes a file, never reads message content, and extracts only tool names '
   + 'and counts from session logs.'
 
@@ -1044,6 +1114,29 @@ function nullableBoolean() {
 /** 可空字符串（`providedBy.name` / `evidenceFile` / 时间戳）。 */
 function nullableString() {
   return { oneOf: [{ type: 'string' }, { type: 'null' }] }
+}
+
+/** §2.26.2 的 `callPresence`（三态 + `null`）。 */
+function callPresenceSchema() {
+  return {
+    oneOf: [
+      { type: 'string', enum: [CALL_PRESENCE.CURRENT_SESSION, CALL_PRESENCE.HISTORICAL_ONLY, CALL_PRESENCE.ABSENT] },
+      { type: 'null' },
+    ],
+  }
+}
+
+/** §2.2 的 `scope.currentSession`（三个子字段全部必需）。 */
+function currentSessionSchema() {
+  return {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      id: nullableString(),
+      basis: { type: 'string', enum: [...CURRENT_SESSION_BASES] },
+      inWindow: { type: 'boolean' },
+    },
+  }
 }
 
 /** §2.13 的 `items[].providedBy` 输出 schema（全部子字段必需）。 */
@@ -1075,6 +1168,10 @@ function itemSchema() {
       calls: nullableInteger(),
       tokensPerCall: nullableInteger(),
       zeroCall: nullableBoolean(),
+      // ── v4（R8）：三个新维度，顺序与 §2.4 字段表逐行一致 ──
+      currentSessionCalls: nullableInteger(),
+      sessionsWithCalls: nullableInteger(),
+      callPresence: callPresenceSchema(),
       usageBasis: { type: 'string', enum: ['tool-calls', 'no-evidence', 'unobservable', 'always-on'] },
       source: { type: 'string' },
       server: { type: 'string' },
@@ -1117,8 +1214,12 @@ function scopeSchema() {
       sessionsScanned: { type: 'integer' },
       sessionsUnreadable: { type: 'integer' },
       sessionsLimit: { type: 'integer' },
+      // ── v4（R8）：窗口边界显式化，顺序与 §2.2 字段表逐行一致 ──
+      sessionsOutsideWindow: { type: 'integer' },
       windowStart: nullableTimestamp,
       windowEnd: nullableTimestamp,
+      windowBasis: { type: 'string', const: SESSION_LOG_MTIME_BASIS },
+      currentSession: currentSessionSchema(),
       linesRead: { type: 'integer' },
       toolCalls: { type: 'integer' },
       skillToolCalls: { type: 'integer' },
@@ -1341,6 +1442,8 @@ function ledgerOutputSchema() {
           },
           prunePlanReclaimableTokens: { type: 'integer' },
           prunePlanBasis: { type: 'string', const: PRUNE_PLAN_BASIS },
+          // v4（R8）：零调用清单的窗口边界声明（与 prunePlanBasis 正交，§2.5）
+          zeroCallBasis: { type: 'string', const: ZERO_CALL_BASIS },
           noRecommendation: {
             type: 'array',
             items: {
@@ -1371,6 +1474,8 @@ function ledgerOutputSchema() {
           observableTokens: { type: 'integer' },
           unknownUsageTokens: { type: 'integer' },
           observedCalls: { type: 'integer' },
+          // v4（R8）：Σ 逐项 currentSessionCalls（非 null）；无此类项时 null
+          currentSessionObservedCalls: nullableInteger(),
           observableTokensPerCall: nullableInteger(),
           zeroCallItems: { type: 'integer' },
           zeroCallTokens: { type: 'integer' },

@@ -9,6 +9,14 @@
  *   E. 面板渲染（极简 hook 运行时 + 元素树→文本）：canonical / 降级 / 零调用 / 折叠 / 错误边界
  *   F. R2（DESIGN §4.7 六条硬性呈现义务）：候选语气、每行五件事实、常驻不确定性声明、
  *      低置信推断标记、unknown 只进 noRecommendation、顺序不二次加工、capped 页脚、证据可查
+ *   G. R3/R6（DESIGN §4.8 六条 + §2.22/§2.24）：可隐藏候选、五条常驻代价声明、未校验不给复制、
+ *      恢复路径、两套动作并列且 token 不相加
+ *   H. R7：右侧栏承载（tab 类型/座位/openTab/优雅降级/两位置义务一条不减）
+ *   I. R8/v4（DESIGN §4.9 六条 + §4.4 三行新状态 + §4.5 的 9 个新键）：
+ *      窗口总 / 本会话 / 覆盖会话数三个数同屏且互不可加；**"不可得"绝不显示为 0**；
+ *      三态（本会话已用 / 仅历史会话用过 / 窗口内从未调用）一眼可辨；窗口边界常驻并让"零调用"
+ *      有参照系；清单口径不扩张；措辞红线（含 title/aria-label）；以及面板字号对齐
+ *      `--dsw-font-*` token 阶梯（主力 12px，行高同步）
  *
  * 宿主依赖走工作区内的符号链接（node_modules/@deepseek-ai/*），链接缺失即整体失败——
  * 这正是「宿主依赖链接后，客户端半区能被解析」的判据。
@@ -17,11 +25,14 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { existsSync, readFileSync, readdirSync, realpathSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import vm from 'node:vm'
+/* J 组（C4/C5）用：把 A18 与实现侧的**实际行为**对上（只读导入，不改 lib）。 */
+import { NAME_REFERENCED_LIMIT, buildHidePlan } from '../lib/hide.js'
 
 const REPO = join(dirname(fileURLToPath(import.meta.url)), '..')
 
@@ -183,8 +194,17 @@ const loaded = loadBundle(mini)
 const V = loaded.plugin.__verify
 
 /** 假 ctx：只记录 apply 触碰的服务与参数。 */
-function fakeContext() {
-  const calls = { effects: [], registers: [], localeRegisters: [], disposers: [] }
+/**
+ * 记录型假 ctx（只实现被测路径真正用到的那几个面）。
+ *
+ * 与服务交互的部分刻意做得**可编排**：`services` 决定 `ctx.get(name)` 看到什么，
+ * `deferred` 决定延迟注入（`ctx.inject(deps, cb)`）是"立即拿到服务"、"永不回调"还是"回调里抛错"，
+ * 于是 H 组的注册形状与优雅降级都能被逐分支断言。
+ */
+function fakeContext(options) {
+  const opts = options ?? {}
+  const calls = { effects: [], registers: [], localeRegisters: [], disposers: [], deferred: [], gets: [], seatRegisters: [] }
+  const services = opts.services ?? {}
   const ctx = {
     effect(callback, label) {
       calls.effects.push({ callback, label })
@@ -193,21 +213,63 @@ function fakeContext() {
       calls.disposers.push(dispose)
       return typeof dispose === 'function' ? dispose : () => {}
     },
+    get(name) {
+      calls.gets.push(name)
+      if (opts.getThrows === true) throw new Error(`hostile get(${name})`)
+      return services[name]
+    },
+    inject(deps, callback) {
+      calls.deferred.push({ deps, callback })
+      const handle = { dispose() { calls.deferredDisposed = (calls.deferredDisposed ?? 0) + 1 } }
+      if (opts.noInject === true) return null
+      if (opts.neverResolves === true) return handle
+      // 服务已在时 cordis 立即挂载子插件；这里用 native 面模拟。
+      const native = {
+        get(name) { return services[name] },
+        slots: {
+          inject(key, cb) { calls.seatInjects = (calls.seatInjects ?? []).concat([key]); return cb() },
+          register(regOptions, component) {
+            calls.seatRegisters.push({ options: regOptions, component })
+            return () => { calls.seatDisposed = (calls.seatDisposed ?? 0) + 1 }
+          },
+        },
+      }
+      if (opts.injectThrows === true) throw new Error('hostile inject')
+      callback(native)
+      return handle
+    },
     locale: {
       register(namespace, dictionaries) {
         calls.localeRegisters.push({ namespace, dictionaries })
         return () => {}
       },
+      bind(namespace) {
+        calls.bound = namespace
+        return (key, params) => dictionaryT(V.dictionaries.zh)(key, params)
+      },
     },
     slots: {
       inject(key, callback) { calls.injectKey = key; calls.injectCallback = callback; return () => {} },
-      register(options, component) {
-        calls.registers.push({ options, component })
+      register(options2, component) {
+        calls.registers.push({ options: options2, component })
         return () => {}
       },
     },
   }
   return { ctx, calls }
+}
+
+/** 一个可编排的右侧栏服务面：`openTab` 记录被打开的类型；`mode` 决定它如何表现。 */
+function fakeSidebarFace(mode) {
+  const calls = []
+  const face = {
+    openTab(kind) {
+      if (mode === 'throws') throw new Error('openTab rejected (no session surface)')
+      calls.push(kind)
+    },
+    isExpanded() { return calls.length > 0 },
+  }
+  return { face, calls }
 }
 
 const T = (key, params) => V.fallbackT(key, params)
@@ -273,6 +335,29 @@ const V3_KEYS = [
   'cl.hide.noUninstall', 'cl.hide.noSum',
 ]
 
+/**
+ * v4 新增键集（9 键；R8 轮，DESIGN §4.5 的 v4 清单）。
+ * v4 的窗口口径**只靠新增键**实现（`cl.zeroCallTitle` 等既有键一字不动，§4.5 的复用规则）：
+ * `absent` 复用既有 `cl.neverCalled`，因此这里只有 9 个键。
+ */
+const V4_KEYS = [
+  'cl.windowScope', 'cl.windowOmitted',
+  'cl.currentSessionCalls', 'cl.sessionCoverage', 'cl.currentSessionTotal',
+  'cl.currentSessionUnknown', 'cl.currentSessionOutsideWindow',
+  'cl.presence.currentSession', 'cl.presence.historicalOnly',
+]
+
+/**
+ * v4 键的**逐字契约文案**（DESIGN §4.4 / §4.9；这些是产品行为，不得自由改写）。
+ * 三态徽标两条与「不可判定」「窗口外」两条的措辞在 §4.4 的 v4 三行里逐字给出。
+ */
+const V4_VALUES = {
+  'cl.presence.currentSession': '本会话已用',
+  'cl.presence.historicalOnly': '本会话未用 · 历史会话用过',
+  'cl.currentSessionUnknown': '本会话：不可判定',
+  'cl.currentSessionOutsideWindow': '（未进入扫描窗口）',
+}
+
 /** v1+v2 既有键里语义不可漂移的代表值（"既有键不得删改"的定点证据）。 */
 const FROZEN_VALUES = {
   'cl.zeroCallTitle': '零调用 · 模型未调用',
@@ -307,13 +392,48 @@ const unknownBy = (candidates, confidence = 'low', method = 'static-scan-weak') 
 })
 
 /**
- * canonical 报告 —— **DESIGN §2.9 v2 完整示例的逐字段副本**（16 items / 4 categories /
- * prunePlan 2 单元 / noRecommendation 3 条）。合成数据，用于展示形状与取值约束。
+ * §2.9（v4）/ §2.26.3 的**逐项三态字段**：与 `items[]` 一一对应（同源数字，合成载荷）。
+ * 单独成表是为了让"哪一项是哪种态"一眼可读，也让夹具与 §2.9 的对应关系可机械核对：
+ *   · `current-session` 4 项（bash 41/12、find 3/5、context_ledger 2/2、read 1/3）
+ *   · `historical-only` 1 项（agent_teams_claim_task 0/2 —— **不进** zeroCall）
+ *   · `absent` 6 项（= `zeroCall === true` 的项数，逐项 0/0）
+ *   · `calls === null` 5 项（instructions/skills）⇒ 三个新字段全 null（I2）
+ */
+const V4_ITEM_TRISTATE = {
+  'mcp:mcp__openviking__add_resource': { currentSessionCalls: 0, sessionsWithCalls: 0, callPresence: 'absent' },
+  'tools:subagent': { currentSessionCalls: 0, sessionsWithCalls: 0, callPresence: 'absent' },
+  'mcp:mcp__openviking__forget': { currentSessionCalls: 0, sessionsWithCalls: 0, callPresence: 'absent' },
+  'tools:task_board_list': { currentSessionCalls: 0, sessionsWithCalls: 0, callPresence: 'absent' },
+  'tools:task_board_github_list': { currentSessionCalls: 0, sessionsWithCalls: 0, callPresence: 'absent' },
+  'tools:task_board_schedule': { currentSessionCalls: 0, sessionsWithCalls: 0, callPresence: 'absent' },
+  'tools:context_ledger': { currentSessionCalls: 2, sessionsWithCalls: 2, callPresence: 'current-session' },
+  'tools:agent_teams_claim_task': { currentSessionCalls: 0, sessionsWithCalls: 2, callPresence: 'historical-only' },
+  'mcp:mcp__openviking__find': { currentSessionCalls: 3, sessionsWithCalls: 5, callPresence: 'current-session' },
+  'tools:read': { currentSessionCalls: 1, sessionsWithCalls: 3, callPresence: 'current-session' },
+  'tools:bash': { currentSessionCalls: 41, sessionsWithCalls: 12, callPresence: 'current-session' },
+  'instructions:/home/u/Desktop/DSHWorkspace/AGENTS.md': { currentSessionCalls: null, sessionsWithCalls: null, callPresence: null },
+  'skills:genui': { currentSessionCalls: null, sessionsWithCalls: null, callPresence: null },
+  'skills:openviking-memory': { currentSessionCalls: null, sessionsWithCalls: null, callPresence: null },
+  'skills:openviking-skills': { currentSessionCalls: null, sessionsWithCalls: null, callPresence: null },
+  'skills:ov-experience-memory': { currentSessionCalls: null, sessionsWithCalls: null, callPresence: null },
+}
+
+/** 给一条 §2.9 条目补上 v4 三态字段（缺表项时补 null，绝不编造 0）。 */
+function v4Tristate(item) {
+  const tri = V4_ITEM_TRISTATE[item.id]
+  return tri === undefined
+    ? { ...item, currentSessionCalls: null, sessionsWithCalls: null, callPresence: null }
+    : { ...item, ...tri }
+}
+
+/**
+ * canonical 报告 —— **DESIGN §2.9 v4 完整示例的逐字段副本**（16 items / 4 categories /
+ * prunePlan 2 单元 / noRecommendation 3 条 / 逐项三态字段）。合成数据，用于展示形状与取值约束。
  */
 function canonicalReport() {
   return {
     tool: 'context_ledger',
-    version: 2,
+    version: 4,
     generatedAt: '2026-10-07T02:41:07.512Z',
     unit: 'token',
     estimator: 'heuristic-v1',
@@ -323,10 +443,14 @@ function canonicalReport() {
       sessionsRoot: '/home/u/.dsh/sessions',
       sessionsAvailable: 41,
       sessionsScanned: 20,
-      sessionsUnreadable: 1,
+      /* v4（§2.9 的合成数据修正）：1 → 0，使 W5（20 + 0 ≤ 20）成立；并补 sessionsOutsideWindow。 */
+      sessionsUnreadable: 0,
       sessionsLimit: 20,
+      sessionsOutsideWindow: 21,
       windowStart: '2026-09-30T00:12:44.001Z',
       windowEnd: '2026-10-07T02:38:19.774Z',
+      windowBasis: 'session-log-mtime',
+      currentSession: { id: '1f0a2b3c-4d5e-6f70-8192-a3b4c5d6e7f8', basis: 'agent-session-id', inWindow: true },
       linesRead: 41233,
       toolCalls: 141,
       skillToolCalls: 9,
@@ -360,7 +484,7 @@ function canonicalReport() {
       { id: 'skills:openviking-memory', category: 'skills', name: 'openviking-memory', tokens: 96, calls: null, tokensPerCall: null, zeroCall: null, usageBasis: 'unobservable', source: 'user-dsh', provider: 'filesystem', bytes: 384 },
       { id: 'skills:openviking-skills', category: 'skills', name: 'openviking-skills', tokens: 88, calls: null, tokensPerCall: null, zeroCall: null, usageBasis: 'unobservable', source: 'user-dsh', provider: 'filesystem', bytes: 352 },
       { id: 'skills:ov-experience-memory', category: 'skills', name: 'ov-experience-memory', tokens: 74, calls: null, tokensPerCall: null, zeroCall: null, usageBasis: 'unobservable', source: 'user-dsh', provider: 'filesystem', bytes: 296 },
-    ],
+    ].map(v4Tristate),
     findings: {
       zeroCall: [
         { id: 'mcp:mcp__openviking__add_resource', category: 'mcp', name: 'mcp__openviking__add_resource', tokens: 402 },
@@ -399,6 +523,8 @@ function canonicalReport() {
       ],
       prunePlanReclaimableTokens: 1405,
       prunePlanBasis: 'model-tool-calls-only',
+      /* v4（§2.5 / §2.26.4 I10）：窗口边界声明，与 prunePlanBasis 正交、两者都必须在场 */
+      zeroCallBasis: 'model-tool-calls-in-window',
       noRecommendation: [
         { reason: 'core', items: 0, tokens: 0 },
         { reason: 'no-owner-bundle', items: 0, tokens: 0 },
@@ -410,6 +536,8 @@ function canonicalReport() {
       observableTokens: 3262,
       unknownUsageTokens: 1198,
       observedCalls: 137,
+      /* v4（§2.6）：Σ 非 null 的 currentSessionCalls = 41 + 3 + 2 + 0 + 1 = 47（≤ 137） */
+      currentSessionObservedCalls: 47,
       observableTokensPerCall: 24,
       zeroCallItems: 6,
       zeroCallTokens: 1807,
@@ -418,17 +546,24 @@ function canonicalReport() {
   }
 }
 
-/** 降级态（DESIGN §2.12）：日志不可读 ⇒ calls 全 null，observedCalls = 0 但不许当实测。 */
+/** 降级态（DESIGN §2.12 v4）：日志不可读 ⇒ calls 全 null，observedCalls = 0 但不许当实测。 */
 function degradedReport() {
   const report = canonicalReport()
   report.scope = {
     ...report.scope, sessionsAvailable: 0, sessionsScanned: 0, sessionsUnreadable: 0,
-    windowStart: null, windowEnd: null, linesRead: 0, toolCalls: 0, skillToolCalls: 0,
+    sessionsOutsideWindow: 0,
+    windowStart: null, windowEnd: null, windowBasis: 'session-log-mtime',
+    /* §2.12 ⑤：会话身份来自运行时对象，不依赖日志是否可读；但 inWindow === false ⇒ 逐项三态全 null。 */
+    currentSession: { id: '1f0a2b3c-4d5e-6f70-8192-a3b4c5d6e7f8', basis: 'agent-session-id', inWindow: false },
+    linesRead: 0, toolCalls: 0, skillToolCalls: 0,
     callsUnmatched: 0, callsUnmatchedNames: [], namesRejected: 0, usageAvailable: false, truncated: false,
     providerScan: { ...report.scope.providerScan, capped: true },
   }
   report.items = report.items.map((item) => (item.category === 'tools' || item.category === 'mcp'
-    ? { ...item, calls: null, tokensPerCall: null, zeroCall: null, usageBasis: 'no-evidence' }
+    ? {
+      ...item, calls: null, tokensPerCall: null, zeroCall: null, usageBasis: 'no-evidence',
+      currentSessionCalls: null, sessionsWithCalls: null, callPresence: null,
+    }
     : item))
   report.categories = report.categories.map((category) => (category.observableUsage
     ? { ...category, calls: null, tokensPerCall: null }
@@ -436,6 +571,8 @@ function degradedReport() {
   report.findings = {
     zeroCall: [], topPerUse: [], prunePlan: [],
     prunePlanReclaimableTokens: 0, prunePlanBasis: 'model-tool-calls-only',
+    /* §2.12 ⑥：zeroCallBasis 照常给出——它声明口径，不声明证据充足 */
+    zeroCallBasis: 'model-tool-calls-in-window',
     noRecommendation: [
       { reason: 'core', items: 0, tokens: 0 },
       { reason: 'no-owner-bundle', items: 0, tokens: 0 },
@@ -444,6 +581,8 @@ function degradedReport() {
   }
   report.totals = {
     ...report.totals, observedCalls: 0, observableTokensPerCall: null,
+    /* §2.12 ⑥：null（不是 0）——"给不出"与"确实是 0"必须可区分 */
+    currentSessionObservedCalls: null,
     zeroCallItems: 0, zeroCallTokens: 0, unknownUsageItems: 11,
   }
   return report
@@ -530,11 +669,17 @@ function attributionReport() {
 /**
  * DESIGN v3 §2.21 的 R6 完整示例（**逐字副本**，从 DESIGN 机械抽取，未手改数字）。
  * 24 个零调用工具 / hidePlanTokens 4261 / prunePlanReclaimableTokens 3376；
- * §2.21.1 的 A1–A17 恒等式在抽取时已逐条复核通过。
+ * §2.21.1 的 A1–A18 恒等式在抽取时已逐条复核通过。
+ *
+ * **v4（R8）同步**：`version` 随 canonical 版本升到 4、`findings.zeroCallBasis` 补进副本
+ * （DESIGN §2.21 在 v4 里的两处变化）；`subagent.registryUse.nameReferencedElsewhere`
+ * 按 §2.19 的升序重排（C4 修正）。
+ * **防漂移**：J 组会把本常量与 `DESIGN.md` §2.21 的 jsonc 块做**机械逐字段比对**并校验
+ * 内容指纹（`SECTION_21_FINGERPRINT`）——DESIGN 将来再改动时，这里会**显式变红**。
  */
 const R6_EXAMPLE = {
   "tool": "context_ledger",
-  "version": 3,
+  "version": 4,
   "unit": "token",
   "items": [
     {
@@ -795,8 +940,8 @@ const R6_EXAMPLE = {
           "verdictBasis": "no-non-model-observability",
           "modelCalls": 0,
           "nameReferencedElsewhere": [
-            "/home/u/.dsh/profiles/web/node_modules/@nanmicoder/dsh-agent-teams/lib/harness-compat.js",
-            "/home/u/.dsh/profiles/web/node_modules/@linxin666/dsh-session-archive/lib/index.js"
+            "/home/u/.dsh/profiles/web/node_modules/@linxin666/dsh-session-archive/lib/index.js",
+            "/home/u/.dsh/profiles/web/node_modules/@nanmicoder/dsh-agent-teams/lib/harness-compat.js"
           ],
           "nonModelCallers": "unobservable"
         },
@@ -1505,6 +1650,7 @@ const R6_EXAMPLE = {
     ],
     "prunePlanReclaimableTokens": 3376,
     "prunePlanBasis": "model-tool-calls-only",
+    "zeroCallBasis": "model-tool-calls-in-window",
     "noRecommendation": [
       {
         "reason": "core",
@@ -1537,7 +1683,8 @@ function r6Report() {
   const sum = (rows) => rows.reduce((total, row) => total + row.tokens, 0)
   return {
     ...base,
-    version: 3,
+    /* version 直接跟随夹具（不再硬编码）：§2.21 是 canonical 的增量片段，两者版本必须一致。 */
+    version: R6_EXAMPLE.version,
     items: [
       ...items.map((item) => ({
         ...item,
@@ -1784,13 +1931,13 @@ test('B2. 宿主插槽契约一手证据（file:line）与控件落座位置', (
   console.log('[证据] slots 服务 dsh-client-ui-renderer/lib/client.js:%d', slotsService + 1)
 })
 
-test('C. 词典：命名空间 context-ledger，zh/en 同键；v1+v2 键一个未删、未改值；v3 键两语言齐全', () => {
+test('C. 词典：命名空间 context-ledger，zh/en 同键；v1+v2+v3 键一个未删、未改值；v4 键两语言齐全', () => {
   assert.equal(V.NS, 'context-ledger')
   const zhKeys = Object.keys(V.dictionaries.zh).sort()
   const enKeys = Object.keys(V.dictionaries.en).sort()
   assert.deepEqual(zhKeys, enKeys, 'zh/en 必须同键（§4.5 硬要求）')
-  assert.deepEqual(zhKeys, [...FROZEN_KEYS, ...V3_KEYS].sort(),
-    '键集 = v1+v2（54，保持）+ v3（45，本轮新增）；不得增删')
+  assert.deepEqual(zhKeys, [...FROZEN_KEYS, ...V3_KEYS, ...V4_KEYS].sort(),
+    '键集 = v1+v2（54，保持）+ v3（45，保持）+ v4（9，本轮新增）；不得增删')
   assert.deepEqual([...V3_KEYS].sort(), [...V3_KEYS].sort())
 
   for (const key of FROZEN_KEYS) {
@@ -1812,6 +1959,19 @@ test('C. 词典：命名空间 context-ledger，zh/en 同键；v1+v2 键一个�
     assert.notEqual(V.dictionaries.zh[key].trim(), '', `${key} 中文文案不得为空`)
     assert.notEqual(V.dictionaries.en[key].trim(), '', `${key} 英文文案不得为空`)
   }
+  /* v4 键两语言齐全且非空 */
+  for (const key of V4_KEYS) {
+    assert.equal(typeof V.dictionaries.zh[key], 'string', `${key} 缺中文文案`)
+    assert.equal(typeof V.dictionaries.en[key], 'string', `${key} 缺英文文案`)
+    assert.notEqual(V.dictionaries.zh[key].trim(), '', `${key} 中文文案不得为空`)
+    assert.notEqual(V.dictionaries.en[key].trim(), '', `${key} 英文文案不得为空`)
+  }
+  /* v4 键：§4.4 里逐字给出的文案不得被改写（三态徽标两条 + 不可判定两条） */
+  for (const [key, value] of Object.entries(V4_VALUES)) {
+    assert.equal(V.dictionaries.zh[key], value, `v4 键 ${key} 的文案是 §4.4 的逐字契约，不得改`)
+  }
+  assert.equal(V.dictionaries.en['cl.presence.currentSession'], 'used in this session')
+  assert.equal(V.dictionaries.en['cl.presence.historicalOnly'], 'not in this session · used in earlier ones')
   // 产品名词不翻译
   for (const noun of ['token', 'schema', 'MCP', 'Context Ledger']) {
     assert.ok(V.dictionaries.zh[keyOf(noun)].includes(noun), `zh 文案应保留产品名词 ${noun}`)
@@ -2079,10 +2239,10 @@ test('A4. 隔离 profile 的 node_modules 能解析出客户端半区（宿主 l
  * ══════════════════════════════════════════════════════════════════════════ */
 
 /** 渲染面板并返回可断言的视图。 */
-function renderPanel(report, t = ZH, verify = V) {
+function renderPanel(report, t = ZH, verify = V, extraProps = {}) {
   mini.reset()
   const tree = mini.render(verify.LedgerPanel, {
-    id: 'p', t, report, state: 'ready', refreshedAt: 0, onRefresh() {},
+    id: 'p', t, report, state: 'ready', refreshedAt: 0, onRefresh() {}, ...extraProps,
   })
   return { tree, nodes: nodesOf(tree), text: textOf(tree) }
 }
@@ -2909,3 +3069,1065 @@ test('G12. 复制清单的两种结局都如实反馈（无剪贴板 ⇒ 提示�
   assert.equal(clipboardV.copyToClipboard('x'), true, '剪贴板可用时返回 true')
   assert.equal(V.copyToClipboard('x'), false, '剪贴板缺席时返回 false（不抛错）')
 })
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * H 组：R7 —— 右侧栏承载（点控件即开栏 + 优雅降级 + 义务不减）
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+
+/** 浮层是否出现在树里（嵌套组件不会被 harness 执行，因此按元素与 props 判断）。 */
+function popoverElements(nodes, verify = V) {
+  return nodes.filter((node) => node.type === verify.LedgerPanel && node.props?.mode === 'popover')
+}
+
+/** 用假 ctx 跑一遍 apply，返回记录。 */
+function applied(options) {
+  const { ctx, calls } = fakeContext(options)
+  loaded.plugin.apply(ctx)
+  // 框架语义：座位声明已存在时 slots.inject 的回调立即执行（composer 控件由此注册）。
+  if (typeof calls.injectCallback === 'function') calls.injectCallback()
+  return { ctx, calls }
+}
+
+/** 从 composer 注册项里取出注入面（框架就是这么给组件塞 props 的）。 */
+function composerFace(calls) {
+  const entry = calls.registers.find((row) => row.options.name === 'conversation.input.right')
+  assert.ok(entry !== undefined, 'composer 控件必须仍注册在 conversation.input.right')
+  assert.equal(typeof entry.options.inject, 'function', '打开入口必须经 slot 的 inject face 注入')
+  return entry.options.inject()
+}
+
+test('H1. 右侧栏 tab 类型：正文与标题两座位共用同一个 key（= 类型 id），符合宿主插槽契约', () => {
+  const { calls } = applied({ services: { sidebarRightTabs: { register: () => () => {} } } })
+
+  // ① 延迟注入只针对可选服务，且不是硬依赖
+  assert.deepEqual(plain(calls.deferred.map((row) => row.deps)), [['sidebarRightTabs']])
+  assert.deepEqual(plain(loaded.plugin.inject), ['slots', 'locale'], '硬依赖不得新增（否则老宿主会卡住/报错）')
+
+  // ② 类型定义：id / kind / title thunk；页类型不认领资源地址
+  const define = calls.deferred[0].callback
+  const typeRegistrations = []
+  const seatRegisters = calls.seatRegisters
+  const nativeRegistrations = []
+  const { ctx, calls: inner } = fakeContext({
+    services: {
+      sidebarRightTabs: {
+        register(definition) { typeRegistrations.push(definition); return () => { inner.typeDisposed = true } },
+      },
+    },
+  })
+  loaded.plugin.apply(ctx)
+  assert.equal(typeRegistrations.length, 1, '必须恰注册一个 tab 类型')
+  const definition = typeRegistrations[0]
+  assert.equal(definition.id, V.LEDGER_TAB_ID)
+  assert.equal(definition.id, 'dsh-context-ledger')
+  assert.equal(definition.kind, V.LEDGER_TAB_KIND)
+  assert.equal(definition.kind, 'context-ledger')
+  assert.equal(typeof definition.title, 'function')
+  assert.equal(definition.title(), 'Context Ledger', 'chip 初始文案走本插件词典（cl.title）')
+  assert.equal(definition.patterns, undefined, '页类型：不申报资源 glob')
+  assert.equal(definition.priority, undefined, '省略 priority = extension 带（外来类型最高）')
+
+  // ③ 两个座位：名字正确、key 同为类型 id、locale 座位指向本命名空间
+  const seats = inner.seatRegisters.map((row) => row.options)
+  assert.deepEqual(plain(seats.map((row) => row.name)).sort(), [...V.LEDGER_TAB_SEATS].sort(),
+    '正文与标题两个座位都要注册')
+  for (const seat of seats) {
+    assert.equal(seat.key, definition.id, `${seat.name} 的 key 必须 = 类型 id（宿主按 id 分派）`)
+    assert.equal(seat.locale, 'context-ledger')
+  }
+  assert.equal(typeof inner.seatRegisters.find((row) => row.options.name === 'sidebar.right.pane.tab').component, 'function')
+  assert.equal(inner.seatRegisters.find((row) => row.options.name === 'sidebar.right.pane.tab').component, V.LedgerTab)
+  assert.equal(inner.seatRegisters.find((row) => row.options.name === 'sidebar.right.pane.tab.title').component, V.LedgerTabTitle)
+  assert.deepEqual(plain(inner.seatInjects).sort(), [...V.LEDGER_TAB_SEATS].sort())
+
+  // ④ 一手契约：两个座位在宿主里都是 keyed/session，且分派 key 取 definition.id
+  const seatContract = readFileSync(join(HOST, 'dsh-client-ui-sidebar-right/lib/types/client/contract/slots.d.ts'), 'utf8').split('\n')
+  for (const seat of V.LEDGER_TAB_SEATS) {
+    const line = seatContract.findIndex((text) => text.includes(`'${seat}': {`))
+    assert.ok(line > 0, `宿主契约里缺 ${seat}`)
+    assert.match(seatContract[line + 1], /kind: 'keyed'/, `${seat} 应为 keyed`)
+    assert.match(seatContract[line + 2], /scope: 'session'/, `${seat} 应为 session 作用域`)
+    console.log('[证据] %s 契约：%s:%d（kind: keyed / scope: session）', seat,
+      'dsh-client-ui-sidebar-right/lib/types/client/contract/slots.d.ts', line + 1)
+  }
+  const runtime = readFileSync(join(HOST, 'dsh-client-ui-sidebar-right/lib/client.js'), 'utf8').split('\n')
+  const dispatch = runtime.findIndex((text) => text.includes('entryKey: definition?.id ?? tab.kind'))
+  assert.ok(dispatch > 0, '宿主按 definition.id 分派 body/title 座位')
+  console.log('[证据] 座位分派：dsh-client-ui-sidebar-right/lib/client.js:%d', dispatch + 1)
+})
+
+test('H2. 点 composer 控件即开右侧栏：走 ctx.sidebarRight.openTab(kind)，同一步展开、不多点一次', () => {
+  const { face, calls: opens } = fakeSidebarFace('ok')
+  const { calls } = applied({ services: { sidebarRight: face, sidebarRightTabs: { register: () => () => {} } } })
+  const injected = composerFace(calls)
+
+  // 注入面就是控件点击时调用的那个函数
+  assert.equal(typeof injected.openLedgerTab, 'function')
+  assert.equal(injected.openLedgerTab(), true, '服务在时必须报告成功（控件据此不再展开浮层）')
+  assert.deepEqual(plain(opens), ['context-ledger'], 'openTab 必须收到我们的 kind')
+
+  // 真点一次：右侧栏接管，浮层不得出现（不得要求用户再点一次）
+  mini.reset()
+  const props = { id: 'p', t: ZH, report: canonicalReport(), state: 'ready', refreshedAt: 0, onRefresh() {}, openLedgerTab: injected.openLedgerTab }
+  let tree = mini.render(V.LedgerRing, { t: ZH, sessionId: 's1', openLedgerTab: injected.openLedgerTab })
+  const trigger = nodesOf(tree).find((node) => node.props?.['data-cl-trigger'] !== undefined)
+  assert.ok(trigger !== undefined)
+  assert.equal(trigger.props['aria-expanded'], false)
+  trigger.props.onClick()
+  assert.deepEqual(plain(opens), ['context-ledger', 'context-ledger'], '点击即开栏')
+  tree = mini.render(V.LedgerRing, { t: ZH, sessionId: 's1', openLedgerTab: injected.openLedgerTab })
+  assert.equal(popoverElements(nodesOf(tree)).length, 0,
+    '右侧栏接管时不得再就地展开浮层（内容已在栏里，不需要第二下）')
+  assert.equal(nodesOf(tree).find((node) => node.props?.['data-cl-trigger'] !== undefined).props['aria-expanded'], false)
+  // 再点一次：仍然交给右侧栏（它会 reveal/focus 已开的那页），不弹浮层、不抛错
+  nodesOf(tree).find((node) => node.props?.['data-cl-trigger'] !== undefined).props.onClick()
+  assert.equal(opens.length, 3)
+  assert.equal(props.state, 'ready')
+})
+
+test('H3. 优雅降级：右侧栏不可用时回退就地浮层，不抛错、控件不是死按钮', () => {
+  const variants = [
+    ['完全没有该服务', { services: {} }],
+    ['服务存在但 face 不完整（无 openTab）', { services: { sidebarRight: { isExpanded: () => true } } }],
+    ['ctx.get 本身抛错', { services: {}, getThrows: true }],
+    ['openTab 抛错（无在屏会话）', { services: { sidebarRight: fakeSidebarFace('throws').face } }],
+  ]
+  for (const [label, options] of variants) {
+    const { calls } = applied(options)
+    const injected = composerFace(calls)
+    let returned
+    assert.doesNotThrow(() => { returned = injected.openLedgerTab() }, `${label}：openLedgerTab 不得抛错`)
+    assert.equal(returned, false, `${label}：必须报告失败，让控件回退`)
+
+    // 控件点击 → 就地浮层出现（不是死按钮）
+    mini.reset()
+    let tree = mini.render(V.LedgerRing, { t: ZH, sessionId: 's1', openLedgerTab: injected.openLedgerTab })
+    const trigger = nodesOf(tree).find((node) => node.props?.['data-cl-trigger'] !== undefined)
+    assert.doesNotThrow(() => trigger.props.onClick(), `${label}：点击不得抛错`)
+    tree = mini.render(V.LedgerRing, { t: ZH, sessionId: 's1', openLedgerTab: injected.openLedgerTab })
+    const panels = popoverElements(nodesOf(tree))
+    assert.equal(panels.length, 1, `${label}：必须回退到就地浮层`)
+    assert.equal(panels[0].props.report !== undefined, true)
+    assert.equal(nodesOf(tree).find((node) => node.props?.['data-cl-trigger'] !== undefined).props['aria-expanded'], true)
+  }
+
+  // 连注入面都缺席（框架没给 props）：同样回退，不抛错
+  mini.reset()
+  let tree = mini.render(V.LedgerRing, { t: ZH, sessionId: 's1' })
+  nodesOf(tree).find((node) => node.props?.['data-cl-trigger'] !== undefined).props.onClick()
+  tree = mini.render(V.LedgerRing, { t: ZH, sessionId: 's1' })
+  assert.equal(popoverElements(nodesOf(tree)).length, 1, '连注入面都没有时同样回退到浮层')
+
+  // 注册侧降级：服务缺席（回调永不执行）/ 注册表残缺 / 注册抛错 / 座位注册抛错 / 没有 inject
+  assert.doesNotThrow(() => applied({ neverResolves: true }))
+  assert.doesNotThrow(() => applied({ services: { sidebarRightTabs: {} } }))
+  assert.doesNotThrow(() => applied({ services: { sidebarRightTabs: { register() { throw new Error('taken id/kind') } } } }))
+  assert.doesNotThrow(() => applied({ injectThrows: true }))
+  const noInject = fakeContext({ noInject: true })
+  assert.doesNotThrow(() => loaded.plugin.apply(noInject.ctx))
+  assert.doesNotThrow(() => noInject.calls.injectCallback(), '座位声明已存在时回调立即执行')
+  assert.equal(noInject.calls.registers.length, 1, '没有延迟注入能力时 composer 控件照旧注册')
+  const noInjectFace = noInject.calls.registers[0].options.inject()
+  assert.equal(noInjectFace.openLedgerTab(), false, '没有右侧栏服务时打开入口报告失败')
+
+  // 座位注册抛错 ⇒ 已注册的类型必须被回滚（不留半套）
+  const rolled = []
+  const { ctx } = fakeContext({ services: { sidebarRightTabs: { register: () => () => { rolled.push('type') } } } })
+  ctx.inject = (deps, callback) => {
+    const native = {
+      get: () => ({ register: () => { rolled.push('registered') ; return () => { rolled.push('type-disposed') } } }),
+      slots: { inject: (key, cb) => cb(), register: () => { throw new Error('seat rejected') } },
+    }
+    callback(native)
+    return { dispose() {} }
+  }
+  assert.doesNotThrow(() => loaded.plugin.apply(ctx))
+  assert.deepEqual(rolled, ['registered', 'type-disposed'], '座位注册失败必须回滚已注册的类型')
+})
+
+test('H4. 既有内容义务在新位置一条不减：§4.7/§4.8 的关键义务在右侧栏版式下同样成立', () => {
+  // 新位置（栏内）渲染同一个 LedgerPanel
+  const { nodes, text } = renderPanel(r6Report(), ZH, V, { mode: 'sidebar' })
+  const panel = nodes.find((node) => node.props?.['data-cl-panel'] !== undefined)
+  assert.equal(panel.props['data-cl-mode'], 'sidebar', '栏内渲染必须标记 sidebar 版式')
+
+  // §4.7 第 1/2/3 条：候选语气 + 每行五件事实 + 声明常驻段底
+  const pruneBlock = blockOf(nodes, 'prune-plan')
+  assert.equal(textOf(fieldOf(pruneBlock, 'data-cl-prune-title')), ZH('cl.prunePlanTitle'))
+  for (const row of pruneRowsOf(nodes)) {
+    for (const field of ['data-cl-prune-unit', 'data-cl-prune-tools', 'data-cl-prune-reclaim',
+      'data-cl-prune-used', 'data-cl-prune-facts']) {
+      assert.ok(textOf(fieldOf(row, field)).trim() !== '', `栏内：${field} 不得为空`)
+    }
+  }
+  const caveat = nodesOf(pruneBlock).filter((node) => node.props?.['data-cl-prune-caveat'] !== undefined)
+  assert.equal(caveat.length, 1)
+  assert.equal(pruneBlock.props.children[pruneBlock.props.children.length - 1],
+    nodesOf(pruneBlock).find((node) => node.props?.['data-cl-prune-caveats'] !== undefined) ?? caveat[0])
+
+  // §4.8 第 1/2/3 条：栏内同样有候选语气标题、五件事实、五条常驻声明
+  const hideBlock = hideBlockOf(nodes)
+  assert.equal(textOf(fieldOf(hideBlock, 'data-cl-hide-title')), ZH('cl.hidePlanTitle'))
+  for (const row of hideRowsOf(nodes)) {
+    for (const field of ['data-cl-hide-name', 'data-cl-hide-unit', 'data-cl-hide-tokens',
+      'data-cl-hide-verdict', 'data-cl-hide-precheck-text']) {
+      assert.ok(textOf(hideRowField(row, field)).trim() !== '', `栏内：${field} 不得为空`)
+    }
+  }
+  assert.equal(nodesOf(hideBlock).filter((node) => node.props?.['data-cl-hide-caveat'] !== undefined).length, 5)
+  // §4.8 第 3 条（建议 ≠ 已施加）+ 第 6 条（恢复路径可查）
+  assert.ok(textOf(fieldOf(hideBlock, 'data-cl-hide-apply-mode')).includes('不会自动施加'))
+  const restoreText = textOf(blockOf(nodes, 'hide-restore'))
+  assert.ok(restoreText.includes('没有“撤销上一条隐藏”的命令'))
+  assert.ok(restoreText.includes('不追溯'))
+  // §3.7：两个动作的 token 仍不相加（栏内同样不出现两笔之和）
+  assert.equal(text.includes('7,637'), false)
+  assert.equal(text.includes('7637'), false)
+  assert.ok(textOf(fieldOf(blockOf(nodes, 'plan-parallel'), 'data-cl-hide-no-sum')).includes('不得相加'))
+  // 明细里的归属徽标/证据行同样在（同一份映射）
+  assert.equal(V.attributionText({ kind: 'unknown', name: null, confidence: 'low' }, ZH), ZH('cl.providedBy.unknown') + ' ?')
+
+  /* 最强形式：两个承载位置的**可见文本与数据标记逐字节相同**，
+   * 唯一差异是外层 section 的版式 / 语义 / mode 标记（内容零分叉）。 */
+  const panelOf = (view) => view.nodes.find((node) => node.props?.['data-cl-panel'] !== undefined)
+  const markersOf = (view) => nodesOf(panelOf(view))
+    .map((node) => Object.keys(node.props ?? {}).filter((key) => key.indexOf('data-cl') === 0).sort().join('|'))
+    .join(',')
+  for (const [label, fixture] of [['§2.9 canonical', canonicalReport()], ['§2.21 R6', r6Report()]]) {
+    const asPopover = renderPanel(fixture, ZH, V, { mode: 'popover' })
+    const asSidebar = renderPanel(fixture, ZH, V, { mode: 'sidebar' })
+    assert.equal(textOf(panelOf(asSidebar)), textOf(panelOf(asPopover)), `${label}：栏内与弹层的可见文本必须逐字相同`)
+    assert.equal(markersOf(asSidebar), markersOf(asPopover), `${label}：数据标记（挂点）必须相同`)
+    const a = panelOf(asPopover).props
+    const b = panelOf(asSidebar).props
+    assert.notEqual(a['data-cl-mode'], b['data-cl-mode'])
+    assert.notEqual(a.style, b.style)
+    assert.notEqual(a.role, b.role)
+    for (const key of Object.keys(a)) {
+      if (key === 'style' || key === 'role' || key === 'data-cl-mode' || key === 'children') continue
+      assert.deepEqual(b[key], a[key], `${label}：除版式/语义外根属性不得不同（${key}）`)
+    }
+    /* 子树逐属性渲染期闭包（onClick）必然不同，故用"节点数 + 文本 + 数据标记"三重一致代替深比。 */
+    assert.equal(nodesOf(panelOf(asSidebar)).length, nodesOf(panelOf(asPopover)).length,
+      `${label}：两承载位置的元素节点数必须相同`)
+  }
+
+  // 弹层版式（默认）仍然一模一样：显式给 mode: 'popover' 复核同一批义务
+  const popover = renderPanel(r6Report(), ZH, V, { mode: 'popover' })
+  assert.equal(popover.nodes.find((node) => node.props?.['data-cl-panel'] !== undefined).props['data-cl-mode'], 'popover')
+  assert.equal(textOf(fieldOf(blockOf(popover.nodes, 'prune-plan'), 'data-cl-prune-title')), ZH('cl.prunePlanTitle'))
+  assert.equal(textOf(fieldOf(hideBlockOf(popover.nodes), 'data-cl-hide-title')), ZH('cl.hidePlanTitle'))
+  assert.equal(popover.text.includes('7,637'), false)
+})
+
+test('H5. 措辞红线在新位置重验：栏内整屏 / tab 标题 / tooltip 属性文本均无禁止词与危险色', () => {
+  const { nodes, text } = renderPanel(r6Report(), ZH, V, { mode: 'sidebar' })
+  for (const bad of [...HIDE_FORBIDDEN, '建议卸载', '可以删掉', '浪费', '无用', 'safe to delete']) {
+    assert.equal(text.includes(bad), false, `栏内整屏不得出现「${bad}」`)
+  }
+  assert.equal(HIDE_IMPERATIVE.test(text), false)
+  const panel = nodes.find((node) => node.props?.['data-cl-panel'] !== undefined)
+  assert.equal(/state-error-primary/.test(JSON.stringify(panel.props.style)), false)
+
+  // tab 标题（chip）与注册表 title thunk：同一份 cl.title，无禁止词、不藏 tooltip
+  const titleTree = V.LedgerTabTitle({ t: ZH })
+  assert.equal(titleTree.props['data-cl-tab-title'], '')
+  assert.equal(textOf(titleTree).trim(), 'Context Ledger')
+  assert.equal(titleTree.props.title, undefined, 'chip 标题不得把文案藏进 tooltip')
+  for (const bad of HIDE_FORBIDDEN) assert.equal(textOf(titleTree).includes(bad), false)
+  assert.equal(V.dictionaries.zh['cl.title'], 'Context Ledger')
+  assert.equal(V.dictionaries.en['cl.title'], 'Context Ledger')
+
+  // composer 触发器的属性型文本（title / aria-label）
+  mini.reset()
+  const ring = mini.render(V.LedgerRing, { t: ZH, sessionId: 's1' })
+  const trigger = nodesOf(ring).find((node) => node.props?.['data-cl-trigger'] !== undefined)
+  for (const attr of [trigger.props.title, trigger.props['aria-label']]) {
+    assert.equal(typeof attr, 'string')
+    for (const bad of HIDE_FORBIDDEN) assert.equal(attr.includes(bad), false, `属性文本不得含「${bad}」`)
+    assert.equal(HIDE_IMPERATIVE.test(attr), false)
+  }
+  console.log('[文案] tab 标题 = %s ｜ 触发器 title = %s', textOf(titleTree), trigger.props.title)
+
+  // 本轮零删改既有词典键（v4 只新增 9 个键；既有 99 键一个未删未改）
+  assert.equal(Object.keys(V.dictionaries.zh).length, FROZEN_KEYS.length + V3_KEYS.length + V4_KEYS.length)
+  assert.deepEqual(Object.keys(V.dictionaries.zh).sort(), Object.keys(V.dictionaries.en).sort())
+})
+
+test('H6. 版式：栏内不再绝对定位/限高，弹层版式原样保留（同一份内容，两个承载位置）', () => {
+  const inSidebar = renderPanel(canonicalReport(), ZH, V, { mode: 'sidebar' })
+  const sidebarPanel = inSidebar.nodes.find((node) => node.props?.['data-cl-panel'] !== undefined)
+  assert.equal(sidebarPanel.props.style.position, undefined, '栏内不得绝对定位')
+  assert.equal(sidebarPanel.props.style.width, '100%')
+  assert.equal(sidebarPanel.props.style.maxHeight, undefined, '栏内不限高（交给栏自己滚动）')
+  assert.equal(sidebarPanel.props.style.borderRadius, 0)
+  assert.equal(sidebarPanel.props.role, 'region', '栏内是栏的一页，不用对话框语义')
+
+  const popover = renderPanel(canonicalReport(), ZH, V, { mode: 'popover' })
+  const popoverPanel = popover.nodes.find((node) => node.props?.['data-cl-panel'] !== undefined)
+  assert.equal(popoverPanel.props.style.position, 'absolute', '弹层版式保持不变（回退路径）')
+  assert.match(String(popoverPanel.props.style.maxHeight), /min\(72vh/)
+  assert.equal(popoverPanel.props.role, 'dialog')
+
+  // tab 正文外壳：占满栏高、自己滚动，并把 mode: 'sidebar' 交给面板
+  mini.reset()
+  const tabTree = mini.render(V.LedgerTab, { t: ZH, sessionId: 's1' })
+  assert.equal(tabTree.props['data-cl-tab'], '')
+  assert.equal(tabTree.props.style.height, '100%')
+  assert.equal(tabTree.props.style.overflowY, 'auto')
+  const boundary = tabTree.props.children[0]
+  assert.equal(boundary.type, V.PanelBoundary, '栏内也要有渲染兜底（面板崩了不许带走栏）')
+  const panelElement = boundary.props.children[0]
+  assert.equal(panelElement.type, V.LedgerPanel)
+  assert.equal(panelElement.props.mode, 'sidebar')
+  assert.equal(panelElement.props.t, ZH)
+  assert.equal(panelElement.props.report, null, '新挂载实例：数据由 useLedgerData 在挂载后拉取')
+  assert.equal(panelElement.props.state, 'idle')
+})
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * I 组：R8/v4 —— DESIGN §4.9 的六条呈现义务 + §4.4 的三行新状态
+ *      + IMPLEMENTATION-NOTES「面板字号对齐 DSH --dsw-font-* 阶梯」
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * 本会话**不在窗口内**（§2.26.2 判定表行 4/5）：逐项 `currentSessionCalls` / `callPresence`
+ * 全为 `null`，`totals.currentSessionObservedCalls` 为 `null`；而窗口口径与**覆盖会话数**
+ * 照常可用（覆盖通道是另一个通道）——这正是"不知道 ≠ 0"最容易被做错的一处的夹具。
+ */
+function outsideWindowReport() {
+  const report = canonicalReport()
+  report.scope = {
+    ...report.scope,
+    currentSession: { id: '1f0a2b3c-4d5e-6f70-8192-a3b4c5d6e7f8', basis: 'agent-session-id', inWindow: false },
+  }
+  report.items = report.items.map((item) => (item.category === 'tools' || item.category === 'mcp'
+    ? { ...item, currentSessionCalls: null, callPresence: null }
+    : item))
+  report.totals = { ...report.totals, currentSessionObservedCalls: null }
+  return report
+}
+
+/** 本会话身份拿不到（§2.2 硬规则 1 / §4.9 第 4 条）：`basis: "unavailable"`、`id: null`。 */
+function unknownSessionReport() {
+  const report = outsideWindowReport()
+  report.scope = { ...report.scope, currentSession: { id: null, basis: 'unavailable', inWindow: false } }
+  report.totals = { ...report.totals, currentSessionObservedCalls: null }
+  return report
+}
+
+/** 渲染面板并展开某个类目（v4 的逐项三态均在条目行里）。 */
+function renderExpanded(report, category, t = ZH, extraProps = {}) {
+  mini.reset()
+  const base = { id: 'p', t, report, state: 'ready', refreshedAt: 0, onRefresh() {}, ...extraProps }
+  const collapsed = mini.render(V.LedgerPanel, base)
+  const head = nodesOf(collapsed).find((node) => node.props?.['data-cl-category'] === category)
+  assert.ok(head !== undefined, `缺类目 ${category}`)
+  head.props.children[0].props.onClick()
+  const tree = mini.render(V.LedgerPanel, base)
+  return { tree, nodes: nodesOf(tree), text: textOf(tree) }
+}
+
+/** 明细里某一项的行节点（外层容器带 `data-cl-item`，行节点带 `data-cl-row`）。 */
+function detailRowOf(nodes, itemId) {
+  const wrapper = nodes.find((node) => node.props?.['data-cl-item'] === itemId)
+  assert.ok(wrapper !== undefined, `明细里必须有 ${itemId}（未被折叠）`)
+  const row = nodesOf(wrapper).find((node) => node.props?.['data-cl-row'] !== undefined)
+  assert.ok(row !== undefined, `${itemId} 缺行节点`)
+  return row
+}
+
+/** 取值格节点（v4：三个数各有自己的数据标记，逐格断言而非对整行做模糊匹配）。 */
+function figureOf(row, marker) {
+  return nodesOf(row).find((node) => node.props?.['data-cl-figure'] === marker)
+}
+
+/** 本地时区的 `MM-DD HH:mm`（与 shortStamp 同口径，独立实现，避免自证）。 */
+function localStamp(iso) {
+  const date = new Date(iso)
+  const pad = (n) => String(n).padStart(2, '0')
+  return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
+}
+
+/** v4 节点（窗口 / 本会话 / 三态 / 覆盖）的标记 + 文本，用于两承载位置的一致性比对。 */
+function v4Signature(nodes) {
+  const isV4 = (node) => Object.keys(node.props ?? {}).some((key) => /^data-cl-(window|presence|current-session|coverage)/.test(key))
+  return nodes.filter(isV4).map((node) => {
+    const marks = Object.keys(node.props).filter((key) => key.indexOf('data-cl') === 0).sort().join('|')
+    return `${marks}::${node.props['data-cl-window-scope'] ?? ''}${node.props['data-cl-window-omitted'] ?? ''}`
+      + `${node.props['data-cl-presence'] ?? ''}::${textOf(node)}`
+  }).join('§')
+}
+
+test('I1. §4.9 第 1 条：窗口总调用 / 本会话 / 覆盖会话数三个数同屏，各有独立节点与标签，互不可加', () => {
+  const report = canonicalReport()
+  const { nodes, text } = renderExpanded(report, 'tools')
+
+  // ① 三个数各自有独立节点（不是堆在一段文字里让人自己算）
+  /* tools 类目按 DETAIL_LIMIT=6 折叠，取行内的三项：context_ledger（calls 3 / 本会话 2 / 覆盖 2）。 */
+  const row = detailRowOf(nodes, 'tools:context_ledger')
+  assert.equal(textOf(figureOf(row, 'calls')), '3', '窗口总调用格 = calls（窗口口径）')
+  const session = nodesOf(row).find((node) => node.props?.['data-cl-current-session'] !== undefined)
+  const coverage = nodesOf(row).find((node) => node.props?.['data-cl-coverage'] !== undefined)
+  assert.equal(session.props['data-cl-current-session'], '2', '本会话格 = currentSessionCalls')
+  assert.equal(coverage.props['data-cl-coverage'], '2', '覆盖格 = sessionsWithCalls')
+  assert.equal(textOf(session), ZH('cl.currentSessionCalls') + ' 2', '本会话格必须自带标签')
+  assert.equal(textOf(coverage), ZH('cl.sessionCoverage', { n: '2', scanned: '20' }),
+    '覆盖会话数必须带分母（分母 = scope.sessionsScanned），写作 n/scanned')
+  assert.equal(textOf(figureOf(row, 'tokens-per-call')), '71', 'tokensPerCall 仍按 calls 计算（不得换分母）')
+
+  // 三个数同屏：同一行的可见文本里同时出现 3（窗口总） / 本会话 2 / 覆盖 2/20
+  const rowText = textOf(row)
+  for (const value of ['3', ZH('cl.currentSessionCalls') + ' 2', '2/20']) {
+    assert.ok(rowText.includes(value), `行内必须同屏出现 ${value}`)
+  }
+  // 三个数各自的列/格标签都在场（不是无标签的三个数字）
+  const categoryBlock = nodes.find((node) => node.props?.['data-cl-block'] === 'categories')
+  for (const label of [ZH('cl.observedCalls'), ZH('cl.currentSessionCalls') + ' 2',
+    ZH('cl.sessionCoverage', { n: '2', scanned: '20' })]) {
+    assert.ok(textOf(categoryBlock).includes(label), `明细里必须有清晰标签：${label}`)
+  }
+
+  // ② 互不可加：构造 100 + 5 的用例，面板**不得**出现任何和数（也不得换分母）
+  const sumReport = canonicalReport()
+  sumReport.scope = { ...sumReport.scope, sessionsScanned: 2, sessionsAvailable: 2, sessionsOutsideWindow: 0 }
+  sumReport.items = sumReport.items.map((item) => (item.id === 'tools:context_ledger'
+    ? { ...item, tokens: 300, calls: 100, tokensPerCall: 3, currentSessionCalls: 5, sessionsWithCalls: 1, callPresence: 'current-session' }
+    : item))
+  const sum = renderExpanded(sumReport, 'tools')
+  const sumRow = detailRowOf(sum.nodes, 'tools:context_ledger')
+  assert.equal(textOf(figureOf(sumRow, 'calls')), '100')
+  assert.equal(textOf(nodesOf(sumRow).find((node) => node.props?.['data-cl-current-session'] !== undefined)),
+    ZH('cl.currentSessionCalls') + ' 5')
+  assert.equal(textOf(figureOf(sumRow, 'tokens-per-call')), '3', '每次使用成本 = round(300 / 100)，未改用本会话数做分母')
+  /* 逐格检查：面板里任何数值格都不得出现"三个数相加"或"改用本会话数做分母"的派生值
+   * （不用整屏子串匹配——千分位数字会让 "460" 这类子串误伤）。 */
+  const figures = sum.nodes.filter((node) => node.props?.['data-cl-figure'] !== undefined).map((node) => textOf(node))
+  assert.equal(figures.includes('105'), false, '三个数不得相加（100 + 5）')
+  assert.equal(figures.includes('60'), false, '不得改用本会话数做 tokensPerCall 的分母（300 / 5）')
+  assert.equal(sum.text.includes('1/2'), true, '覆盖会话数照实呈现')
+
+  // ③ 面板不得派生"平均每次会话调用"之类结论（§2.26.1 硬规则 3 / §6 第 12 条③）
+  for (const banned of ['平均', '最活跃', 'average', 'most active', '最近一次调用']) {
+    assert.equal(text.includes(banned), false, `不得派生结论「${banned}」`)
+  }
+})
+
+test('I2. §4.9 第 3/4 条：「不可得」与「0」视觉可分——本会话维度拿不到时绝不显示 0', () => {
+  // ① 真 0：本会话在窗口内、该工具在窗口内确实没被调用（canonical 的 absent 项）
+  const zeros = renderExpanded(canonicalReport(), 'tools')
+  const absent = detailRowOf(zeros.nodes, 'tools:task_board_list')
+  assert.equal(absent.props['data-cl-presence'], 'absent')
+  const absentFigure = nodesOf(absent).find((node) => node.props?.['data-cl-current-session'] !== undefined)
+  assert.equal(absentFigure.props['data-cl-current-session'], '0', '窗口内的真零调用：本会话数是 0（有证据）')
+  assert.equal(textOf(absentFigure), ZH('cl.currentSessionCalls') + ' 0')
+  assert.ok(textOf(zeros.nodes.find((node) => node.props?.['data-cl-current-session-summary'] !== undefined))
+    .includes('47'), '总览的本会话调用数是宿主给的值')
+
+  // ② 不可得：本会话不在窗口内 ⇒ 逐项不显示 0，显示"不可判定 + 原因"
+  const outside = renderExpanded(outsideWindowReport(), 'tools')
+  const missing = detailRowOf(outside.nodes, 'tools:context_ledger')
+  assert.equal(missing.props['data-cl-presence'], 'unavailable', '拿不到三态就标记 unavailable，不猜')
+  const missingFigure = nodesOf(missing).find((node) => node.props?.['data-cl-current-session'] !== undefined)
+  assert.equal(missingFigure.props['data-cl-current-session'], 'unavailable')
+  assert.equal(textOf(missingFigure), ZH('cl.currentSessionUnknown') + ZH('cl.currentSessionOutsideWindow'),
+    '必须写成"本会话：不可判定（未进入扫描窗口）"，且给出原因')
+  /* 视觉可分的最强证据：真 0 是普通数字格，不可得是**中性灰徽标**（§4.4 的 v4 第 3 行）。 */
+  assert.equal(absentFigure.props.style.border, undefined, '真 0 是普通数字格')
+  assert.equal(typeof missingFigure.props.style.border, 'string', '"不可判定"必须渲染成中性灰徽标')
+  assert.notEqual(missingFigure.props.style.borderRadius, absentFigure.props.style.borderRadius)
+  assert.equal(/本会话 0/.test(outside.text), false, '不可得**绝不**显示成本会话 0 次')
+  /* 该报告里仍有**真**零调用项（窗口口径 calls === 0，有证据）——那不矛盾：
+   * 被禁止的是把"本会话拿不到"渲染成 0，所以这里逐行检查"零调用徽标只跟着窗口零调用走"。 */
+  const outsideRows = outside.nodes.filter((node) => node.props?.['data-cl-row'] !== undefined)
+  for (const row of outsideRows) {
+    const zeroChips = nodesOf(row).filter((node) => node.props?.['data-cl-state'] === 'zero'
+      && node.props?.['data-cl-row'] === undefined)
+    if (row.props['data-cl-state'] === 'used') {
+      assert.equal(zeroChips.length, 0, '本会话拿不到时，非零调用行不得出现任何零调用徽标')
+    } else {
+      assert.equal(zeroChips.length, 1, '窗口口径的真零调用仍然只用零调用徽标')
+      assert.equal(textOf(zeroChips[0]), ZH('cl.neverCalled'))
+    }
+  }
+  const zeroBlockRows = nodesOf(blockOf(outside.nodes, 'zero-call'))
+    .filter((node) => node.props?.['data-cl-row'] !== undefined)
+  assert.equal(zeroBlockRows.filter((row) => row.props['data-cl-state'] === 'zero').length,
+    outsideWindowReport().findings.zeroCall.length, '零调用段只含宿主给的零调用项')
+  // 覆盖会话数是**另一个**通道：本会话拿不到，不影响它照实呈现
+  const coverage = nodesOf(missing).find((node) => node.props?.['data-cl-coverage'] !== undefined)
+  assert.equal(coverage.props['data-cl-coverage'], '2')
+
+  // ③ 总览：null ⇒ 不可判定（不是 0），并给出原因；且与"有数"时的样式不同
+  const summary = outside.nodes.find((node) => node.props?.['data-cl-current-session-summary'] !== undefined)
+  const total = nodesOf(summary).find((node) => node.props?.['data-cl-current-session-total'] !== undefined)
+  assert.equal(total.props['data-cl-current-session-total'], 'unavailable')
+  assert.equal(textOf(total), ZH('cl.currentSessionUnknown'))
+  const knownTotal = nodesOf(zeros.nodes.find((node) => node.props?.['data-cl-current-session-summary'] !== undefined))
+    .find((node) => node.props?.['data-cl-current-session-total'] !== undefined)
+  assert.equal(knownTotal.props['data-cl-current-session-total'], 'value')
+  assert.equal(textOf(knownTotal), '47')
+  assert.notEqual(total.props.style.fontSize, knownTotal.props.style.fontSize,
+    '"不可判定"与"有数"必须用不同字号/样式（未知不得长得像数字）')
+  assert.equal(textOf(nodesOf(summary).find((node) => node.props?.['data-cl-current-session-reason'] !== undefined)),
+    ZH('cl.currentSessionOutsideWindow'))
+
+  // ④ 会话身份拿不到（basis: "unavailable"）：仍然不可判定、仍然不显示 0，且绝不显示 id
+  const unknown = renderExpanded(unknownSessionReport(), 'tools')
+  const unknownSummary = unknown.nodes.find((node) => node.props?.['data-cl-current-session-summary'] !== undefined)
+  const basis = nodesOf(unknownSummary).find((node) => node.props?.['data-cl-current-session-basis'] !== undefined)
+  assert.equal(basis.props['data-cl-current-session-basis'], 'unavailable', '身份来源必须如实呈现')
+  assert.equal(textOf(nodesOf(unknownSummary).find((node) => node.props?.['data-cl-current-session-total'] !== undefined)),
+    ZH('cl.currentSessionUnknown'))
+  for (const view of [zeros, outside, unknown]) {
+    assert.equal(view.text.includes('1f0a2b3c-4d5e-6f70-8192-a3b4c5d6e7f8'), false,
+      '§2.26.5 第 6 条：会话 id 是标识，不得上屏（不当标题/用户名）')
+  }
+
+  // ⑤ 降级态（usageAvailable === false）：observedCalls=0 与"本会话不可判定"都必须如实
+  const degraded = renderPanel(degradedReport())
+  assert.equal(degraded.text.includes('本会话 0'), false, '降级态不得把"没有证据"渲染成本会话 0 次')
+  assert.ok(textOf(degraded.nodes.find((node) => node.props?.['data-cl-current-session-summary'] !== undefined))
+    .includes(ZH('cl.currentSessionUnknown')), '降级态的总览本会话数必须是"不可判定"')
+
+  // ⑥ 面板不承载任意宿主串：basis 不匹配契约形状时按 unavailable 处理，原字符串绝不上屏
+  const hostile = outsideWindowReport()
+  const HOSTILE = '<img src=x onerror=alert(1)>' + 'x'.repeat(200)
+  hostile.scope = { ...hostile.scope, currentSession: { id: null, basis: HOSTILE, inWindow: false } }
+  const safe = renderPanel(hostile)
+  assert.equal(safe.text.includes(HOSTILE), false, '宿主给的任意串不得上屏')
+  const safeBasis = safe.nodes.find((node) => node.props?.['data-cl-current-session-basis'] !== undefined)
+  assert.equal(safeBasis.props['data-cl-current-session-basis'], 'unavailable')
+})
+
+test('I3. §4.9 第 5 条 + §4.4 三行新状态：三态一眼可辨，只有 absent 用零调用样式', () => {
+  const { nodes } = renderExpanded(canonicalReport(), 'tools')
+
+  const current = detailRowOf(nodes, 'tools:context_ledger')
+  const historical = detailRowOf(nodes, 'tools:agent_teams_claim_task')
+  const absent = detailRowOf(nodes, 'tools:task_board_list')
+
+  // ① 三态取值互异且恰好取契约里的三个值
+  assert.deepEqual(plain([current, historical, absent].map((row) => row.props['data-cl-presence'])),
+    ['current-session', 'historical-only', 'absent'])
+  assert.deepEqual(plain(V.PRESENCE_VALUES), ['current-session', 'historical-only', 'absent'])
+
+  // ② 每态有自己的徽标/文案（不是堆三个数字让人自己算）
+  const badgeOf = (row) => nodesOf(row).find((node) => node.props?.['data-cl-presence'] !== undefined
+    && node.props?.['data-cl-row'] === undefined)
+  const currentBadge = badgeOf(current)
+  const historicalBadge = badgeOf(historical)
+  assert.equal(textOf(currentBadge), ZH('cl.presence.currentSession'))
+  assert.equal(textOf(historicalBadge), ZH('cl.presence.historicalOnly'))
+  const histSession = nodesOf(historical).find((node) => node.props?.['data-cl-current-session'] !== undefined)
+  const histCoverage = nodesOf(historical).find((node) => node.props?.['data-cl-coverage'] !== undefined)
+  assert.equal(textOf(histSession), ZH('cl.currentSessionCalls') + ' 0', '历史会话用过 ⇒ 本会话数是 0（有证据的 0）')
+  assert.equal(textOf(histCoverage), ZH('cl.sessionCoverage', { n: '2', scanned: '20' }))
+  /* absent 态**复用**零调用徽标（cl.neverCalled）——同一行里不重复画第二个琥珀标记 */
+  assert.ok(textOf(absent).includes(ZH('cl.neverCalled')), 'absent 必须用零调用徽标')
+  assert.equal(nodesOf(absent).filter((node) => node.props?.['data-cl-presence'] !== undefined
+    && node.props?.['data-cl-row'] === undefined).length, 0,
+  'absent 不再另画一个琥珀徽标（§4.4 v4 硬规则③：同一行不得出现两个「0 次」标记）')
+
+  // ③ 视觉可区分：三态颜色两两不同，且 only absent 是琥珀
+  const colors = ['current-session', 'historical-only', 'absent'].map((state) => V.presenceColor(state))
+  assert.equal(new Set(colors).size, 3, '三态颜色必须两两不同')
+  assert.equal(V.presenceColor('absent'), V.chipColor('zero'), 'absent 用零调用色')
+  assert.notEqual(V.presenceColor('historical-only'), V.chipColor('zero'), 'historical-only 绝不能用零调用色')
+  assert.notEqual(V.presenceColor('current-session'), V.chipColor('zero'), 'current-session 绝不能用零调用色')
+  assert.equal(historicalBadge.props.style.color, V.presenceColor('historical-only'))
+  assert.equal(currentBadge.props.style.color, V.presenceColor('current-session'))
+  assert.equal(/state-error-primary|state-warn-primary/.test(JSON.stringify(historicalBadge.props.style)), false,
+    'historical-only 不得带告警样式')
+
+  // ④ 三态行的可见文本互不相同（"一眼可辨"的最强形式）
+  const texts = [current, historical, absent].map((row) => textOf(row))
+  assert.equal(new Set(texts).size, 3)
+  // historical-only 不得被读成零调用：它不进 findings.zeroCall，也不该出现「0 次」以外让人误会的东西
+  assert.equal(texts[1].includes(ZH('cl.neverCalled')), false, 'historical-only 绝不用零调用徽标')
+  assert.equal(nodesOf(historical).filter((node) => node.props?.['data-cl-state'] === 'zero').length, 0)
+})
+
+test('I4. §4.9 第 2 条 + §2.2：窗口边界常驻两段，让"零调用"有明确参照系', () => {
+  const report = canonicalReport()
+  const { nodes, text } = renderPanel(report)
+
+  // ① 总览段与零调用段**都**有窗口声明行，且都带 sessionsScanned/available + 窗口区间 + windowBasis
+  const scopes = nodes.filter((node) => node.props?.['data-cl-window-scope'] !== undefined)
+  assert.deepEqual(plain(scopes.map((node) => node.props['data-cl-window-scope'])), ['overview', 'zero-call'],
+    '两个承载位置的窗口声明行都得在（§4.2 第 2/3 段）')
+  const expectWindow = ZH('cl.windowScope', {
+    scanned: '20', available: '41',
+    start: localStamp(report.scope.windowStart), end: localStamp(report.scope.windowEnd),
+    basis: 'session-log-mtime',
+  })
+  for (const node of scopes) {
+    assert.equal(textOf(node), expectWindow, '窗口声明必须同时给出扫描数/总数、窗口区间与边界来源')
+  }
+  // 窗口边界与 windowBasis 一起呈现（§5 v4 第 4 条：否则会被读成日志内的事件时间）
+  assert.ok(expectWindow.includes('session-log-mtime'))
+  assert.ok(expectWindow.includes(localStamp(report.scope.windowStart)))
+  assert.equal(V.windowScopeOf(report).basis, 'session-log-mtime')
+
+  // ② 窗口外会话数：> 0 必须追加一行；= 0 不得出现
+  const omitted = nodes.filter((node) => node.props?.['data-cl-window-omitted'] !== undefined)
+  assert.deepEqual(plain(omitted.map((node) => node.props['data-cl-window-omitted'])), ['overview', 'zero-call'])
+  for (const node of omitted) {
+    assert.equal(textOf(node), ZH('cl.windowOmitted', { n: '21' }))
+  }
+  const inside = renderPanel({ ...report, scope: { ...report.scope, sessionsOutsideWindow: 0 } })
+  assert.equal(inside.nodes.filter((node) => node.props?.['data-cl-window-omitted'] !== undefined).length, 0,
+    'sessionsOutsideWindow = 0 时不追加那一行')
+
+  // ③ 窗口声明常驻零调用段**段底**、不可折叠、不做 tooltip（§4.9 第 2 条）
+  const zeroBlock = blockOf(nodes, 'zero-call')
+  const last = zeroBlock.props.children[zeroBlock.props.children.length - 1]
+  assert.equal(last.props['data-cl-window-omitted'], 'zero-call', '零调用段最后一行就是窗口声明')
+  for (const node of scopes.concat(omitted)) {
+    assert.equal(node.type, 'p', '窗口声明是普通段落（不是按钮/折叠容器）')
+    assert.equal(node.props.title, undefined, '不得收进 tooltip')
+    assert.equal(node.props.onClick, undefined, '不得可折叠')
+    assert.equal(/state-error-primary/.test(JSON.stringify(node.props.style)), false, '窗口边界不是告警')
+  }
+  assert.ok(textOf(zeroBlock).includes(ZH('cl.windowScope', {
+    scanned: '20', available: '41',
+    start: localStamp(report.scope.windowStart), end: localStamp(report.scope.windowEnd),
+    basis: 'session-log-mtime',
+  })), '零调用段自己就带着参照系')
+
+  // ④ 降级态（没有窗口）也照常给出窗口口径，且不泄漏 undefined/NaN
+  const degraded = renderPanel(degradedReport())
+  assert.equal(degraded.nodes.filter((node) => node.props?.['data-cl-window-scope'] !== undefined).length, 2,
+    '没有窗口不等于没有窗口口径（§2.12 ④）')
+  assert.equal(degraded.text.includes('undefined'), false)
+  assert.equal(degraded.text.includes('NaN'), false)
+  assert.ok(textOf(degraded.nodes.find((node) => node.props?.['data-cl-window-scope'] !== undefined))
+    .includes(ZH('cl.unknown')), '没有窗口时区间如实写成未知，不编造时刻')
+})
+
+test('I5. 字号对齐 DSH token 阶梯 + 行高同步（IMPLEMENTATION-NOTES 界面决定备案）', () => {
+  // ① 不得再出现硬编码像素字号（硬编码不会跟随主题/字号缩放）
+  assert.equal(/fontSize:\s*[0-9]/.test(CLIENT_SRC), false, '不得硬编码像素字号')
+  assert.equal(/fontSize:\s*'[0-9]/.test(CLIENT_SRC), false, '不得写死字符串字号')
+
+  // ② 五档 token 都在场、都带 fallback
+  for (const token of ['xxxs-11', 'xxs-12', 'xs-13', 's-14', 'l-20']) {
+    assert.ok(CLIENT_SRC.includes(`var(--dsw-font-${token}-font-size, `), `缺 token ${token} 的字号变量`)
+  }
+  const fallback = (value) => Number(/,\s*([0-9.]+)px\)$/.exec(value)[1])
+  assert.equal(fallback(V.FONT_SIZES.xxxs11), 11)
+  assert.equal(fallback(V.FONT_SIZES.xxs12), 12, '主力档 = 12px（对齐 dsh-annotate 的正文基准）')
+  assert.equal(fallback(V.FONT_SIZES.xs13), 13)
+  assert.equal(fallback(V.FONT_SIZES.s14), 14)
+  assert.equal(fallback(V.FONT_SIZES.l20), 20)
+  for (const value of Object.values(V.FONT_SIZES)) {
+    assert.ok(fallback(value) >= 11, '面板不得再出现低于宿主最小档（11px）的字号')
+  }
+
+  // ③ 用量分布：主力是 12px 档，且 12/13 档压过 11px 档（正文基准不再低于 annotate）
+  const count = (needle) => (CLIENT_SRC.match(new RegExp(needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')) ?? []).length
+  const sizes = { xxxs11: count('fontSize: FS.xxxs11'), xxs12: count('fontSize: FS.xxs12'), xs13: count('fontSize: FS.xs13') }
+  assert.ok(sizes.xxs12 >= 18, `主力档（12px）至少 18 处，实际 ${sizes.xxs12}`)
+  assert.ok(sizes.xs13 >= 11, `次级档（13px）至少 11 处，实际 ${sizes.xs13}`)
+  assert.ok(sizes.xxxs11 >= 9, `小标签档（11px）至少 9 处，实际 ${sizes.xxxs11}`)
+  assert.ok(Math.max(sizes.xxs12, sizes.xs13) === sizes.xxs12, '12px 是主力档')
+  assert.ok(sizes.xxs12 + sizes.xs13 > sizes.xxxs11, '正文基准档应多于最低档')
+  assert.equal(count('fontSize: FS.l20'), 1, '总览数字（20px）保持')
+
+  // ④ 行高同步：渲染出来的每个带字号的节点都必须同时带行高（20px 数字档用紧排比例）
+  const sizesOf = Object.values(V.FONT_SIZES)
+  const lineHeightsOf = Object.values(V.FONT_LINE_HEIGHTS)
+  for (const [label, report] of [['§2.9 v4', canonicalReport()], ['§2.21 R6', r6Report()], ['§2.12 降级', degradedReport()]]) {
+    const { nodes } = renderPanel(report)
+    let checked = 0
+    for (const node of nodes) {
+      const style = node.props?.style
+      if (style === undefined || style.fontSize === undefined) continue
+      checked += 1
+      assert.ok(sizesOf.includes(style.fontSize), `${label}：字号必须是宿主 token，实际 ${style.fontSize}`)
+      if (style.fontSize === V.FONT_SIZES.l20) {
+        assert.equal(typeof style.lineHeight, 'number', `${label}：20px 数字档用紧排比例行高`)
+        continue
+      }
+      assert.ok(lineHeightsOf.includes(style.lineHeight),
+        `${label}：字号 ${style.fontSize} 必须同步行高 token，实际 ${style.lineHeight}`)
+      assert.equal(style.lineHeight, V.FONT_LINE_HEIGHTS[/xxxs-11|xxs-12|xs-13|s-14/.exec(style.fontSize)[0]
+        .replace('xxxs-11', 'xxxs11').replace('xxs-12', 'xxs12').replace('xs-13', 'xs13').replace('s-14', 's14')],
+      `${label}：字号与行高必须同档`)
+    }
+    assert.ok(checked >= 15, `${label}：带字号的渲染节点样本太少（${checked}）`)
+  }
+
+  // ⑤ 定点：标题 14px/22px、条目名 13px/20px、总览数字 20px、徽标 11px/14px
+  const { nodes } = renderExpanded(canonicalReport(), 'tools')
+  const title = nodes.find((node) => textOf(node) === ZH('cl.title'))
+  assert.equal(title.props.style.fontSize, V.FONT_SIZES.s14)
+  assert.equal(title.props.style.lineHeight, V.FONT_LINE_HEIGHTS.s14)
+  const row = detailRowOf(nodes, 'tools:context_ledger')
+  const nameCell = nodesOf(row).find((node) => node.props?.['data-cl-row'] === undefined && node.props?.style?.fontSize === V.FONT_SIZES.xs13)
+  assert.ok(nameCell !== undefined, '条目名用 13px 档')
+  const statNumber = nodes.find((node) => textOf(node) === '4,460' && node.props?.style?.fontSize !== undefined)
+  assert.equal(statNumber.props.style.fontSize, V.FONT_SIZES.l20)
+  const sessionFigure = nodesOf(row).find((node) => node.props?.['data-cl-current-session'] !== undefined)
+  assert.equal(sessionFigure.props.style.fontSize, V.FONT_SIZES.xxxs11)
+  assert.equal(sessionFigure.props.style.lineHeight, V.FONT_LINE_HEIGHTS.xxxs11)
+})
+
+test('I6. 措辞红线（§6 第 10/11/12 条）：新增文案与属性型文本一并穷举，且无危险色', () => {
+  /** v4 新增文案与既有文案共用同一份红线（"浪费/建议卸载/从未使用"类确定性措辞）。 */
+  const FORBIDDEN = [
+    '无用', '浪费', '可以删掉', '建议卸载', '应该删除', '值得删除', '该删',
+    '从未使用', '从来没用过', '从未用过', '建议隐藏', '安全隐藏', '安全移除',
+    '零损失', '零功能损失', '无副作用', '放心删', '只影响模型',
+    'never used', 'never been used', 'worthless', 'wasted', 'safe to delete', 'safe to hide',
+    'safe to remove', 'recommend removing', 'should be uninstalled', 'you should remove',
+    'no side effects', 'zero loss', 'removable', 'no longer used',
+  ]
+  const views = [
+    ['§2.9 v4', canonicalReport()],
+    ['§2.9 本会话不在窗口内', outsideWindowReport()],
+    ['§2.9 身份不可得', unknownSessionReport()],
+    ['§2.21 R6', r6Report()],
+    ['§2.12 降级', degradedReport()],
+  ]
+  for (const [label, report] of views) {
+    for (const [lang, dict] of Object.entries(V.dictionaries)) {
+      const { nodes, text } = renderPanel(report, dictionaryT(dict))
+      for (const bad of FORBIDDEN) {
+        assert.equal(text.includes(bad), false, `${label}/${lang}：整屏不得出现「${bad}」`)
+      }
+      // 属性型文本（title / aria-label）同样纳入穷举：不得把危险措辞藏进 tooltip
+      for (const node of nodes) {
+        for (const attr of ['title', 'aria-label']) {
+          const value = node.props?.[attr]
+          if (typeof value !== 'string') continue
+          for (const bad of FORBIDDEN) {
+            assert.equal(value.includes(bad), false, `${label}/${lang}：属性 ${attr} 不得含「${bad}」`)
+          }
+          assert.equal(HIDE_IMPERATIVE.test(value), false, `${label}/${lang}：属性 ${attr} 不得是命令式建议`)
+        }
+      }
+    }
+    // 词典本身（两种语言）也不得含红线词
+    for (const [lang, dict] of Object.entries(V.dictionaries)) {
+      for (const [key, value] of Object.entries(dict)) {
+        for (const bad of FORBIDDEN) {
+          assert.equal(value.includes(bad), false, `词典 ${lang}/${key} 不得含「${bad}」`)
+        }
+      }
+    }
+  }
+
+  /* 「没用」一词只允许出现在固定的否定式声明里（§4.7 第 3 条的"不代表没用"），
+   * 不得作为结论出现在任何其它位置——这是 §6 第 10 条最容易被顺手写坏的一处。 */
+  for (const [label, report] of views) {
+    const { text } = renderPanel(report, ZH)
+    for (const match of text.matchAll(/没用/g)) {
+      assert.equal(text.slice(Math.max(0, match.index - 3), match.index), '不代表',
+        `${label}：「没用」只能出现在否定式声明里`)
+    }
+  }
+
+  // v4 节点一律不使用危险红/告警色（"unknown" 与"零调用"都不是危害）
+  const { nodes } = renderExpanded(canonicalReport(), 'tools')
+  const v4Nodes = nodes.filter((node) => Object.keys(node.props ?? {}).some((key) => /^data-cl-(window|presence|current-session|coverage)/.test(key)))
+  assert.ok(v4Nodes.length >= 10, 'v4 节点样本应充足')
+  for (const node of v4Nodes) {
+    assert.equal(/state-error-primary/.test(JSON.stringify(node.props.style)), false,
+      `v4 节点不得使用危险色：${JSON.stringify(node.props.style)}`)
+  }
+})
+
+test('I7. §4.9 第 6 条：三态不扩张清单口径——historical-only 不进三段，但也不被面板筛掉', () => {
+  const report = canonicalReport()
+  const { nodes } = renderPanel(report)
+
+  // ① 零调用段：每行都必须是 absent（zeroCall ⟺ absent，§2.26.4 I7）
+  const zeroRows = nodesOf(blockOf(nodes, 'zero-call')).filter((node) => node.props?.['data-cl-row'] !== undefined)
+  assert.equal(zeroRows.length, report.findings.zeroCall.length, '零调用段行数恒等于宿主给的 findings.zeroCall')
+  assert.deepEqual([...new Set(zeroRows.map((row) => row.props['data-cl-presence']))], ['absent'])
+  assert.equal(textOf(blockOf(nodes, 'zero-call')).includes('agent_teams_claim_task'), false,
+    'historical-only 绝不出现在零调用段（它不是零调用）')
+
+  // ② 每次使用最贵段：historical-only 的项**必须**照旧出现（面板不按三态筛选，§4.9 第 6 条）
+  const topRows = nodesOf(blockOf(nodes, 'top-per-use')).filter((node) => node.props?.['data-cl-row'] !== undefined)
+  assert.equal(topRows.length, report.findings.topPerUse.length)
+  const historicalRow = topRows.find((row) => row.props['data-cl-presence'] === 'historical-only')
+  assert.ok(historicalRow !== undefined, 'historical-only 的项在「每次使用最贵」里不得被筛掉')
+  assert.ok(textOf(historicalRow).includes('agent_teams_claim_task'))
+
+  // ③ 裁剪候选 / 可隐藏候选段的入组条件仍是 zeroCall === true：两段都不含该工具
+  const pruneText = textOf(blockOf(nodes, 'prune-plan'))
+  assert.equal(pruneText.includes('agent_teams_claim_task'), false)
+  assert.equal(V.pruneEntries(report).some((entry) => (entry.items ?? []).some((item) => item.name === 'agent_teams_claim_task')), false)
+  assert.equal(V.hideEntries(r6Report()).some((entry) => String(entry.name) === 'agent_teams_claim_task'), false)
+  assert.equal(V.hideEntries(r6Report()).length, r6Report().findings.hidePlan.length, '可隐藏候选段不筛选宿主给的清单')
+})
+
+test('I8. §4.9 在两个承载位置都适用：v4 节点与文本在两位置逐字相同', () => {
+  const report = canonicalReport()
+  const expanded = { mode: 'popover' }
+  const popover = renderExpanded(report, 'tools', ZH, expanded)
+  const sidebar = renderExpanded(report, 'tools', ZH, { mode: 'sidebar' })
+  assert.equal(v4Signature(sidebar.nodes), v4Signature(popover.nodes),
+    'v4 的窗口/本会话/三态/覆盖节点在两承载位置必须一模一样（右侧栏不是简版）')
+  assert.ok(v4Signature(popover.nodes).length > 0)
+  const panel = sidebar.nodes.find((node) => node.props?.['data-cl-panel'] !== undefined)
+  assert.equal(panel.props['data-cl-mode'], 'sidebar')
+})
+
+test('I9. 面板文案实况（人读用）：R8 的窗口口径 / 本会话 / 三态逐行打印', () => {
+  const lines = []
+  const push = (label, node) => lines.push(`${label}: ${textOf(node).replace(/\s+/g, ' ').trim()}`)
+
+  const report = canonicalReport()
+  const { nodes } = renderPanel(report)
+  push('[窗口口径 · 总览]', nodes.find((node) => node.props?.['data-cl-window-scope'] === 'overview'))
+  push('[窗口外会话 · 总览]', nodes.find((node) => node.props?.['data-cl-window-omitted'] === 'overview'))
+  push('[窗口口径 · 零调用段]', nodes.find((node) => node.props?.['data-cl-window-scope'] === 'zero-call'))
+  push('[窗口外会话 · 零调用段]', nodes.find((node) => node.props?.['data-cl-window-omitted'] === 'zero-call'))
+  push('[本会话调用 · 总览]', nodes.find((node) => node.props?.['data-cl-current-session-summary'] !== undefined))
+  push('[零调用段标题]', nodes.find((node) => String(node.props?.key) === 'title' && textOf(node).includes(ZH('cl.zeroCallTitle'))))
+
+  const expanded = renderExpanded(report, 'tools')
+  for (const [label, id] of [
+    ['current-session', 'tools:context_ledger'],
+    ['historical-only', 'tools:agent_teams_claim_task'],
+    ['absent', 'tools:task_board_list'],
+  ]) {
+    push(`[逐项 ${label}]`, detailRowOf(expanded.nodes, id))
+  }
+
+  const outside = renderPanel(outsideWindowReport())
+  push('[不可得 · 总览]', outside.nodes.find((node) => node.props?.['data-cl-current-session-summary'] !== undefined))
+  push('[不可得 · 逐项]', detailRowOf(renderExpanded(outsideWindowReport(), 'tools').nodes, 'tools:context_ledger'))
+
+  const unknown = renderPanel(unknownSessionReport())
+  push('[身份不可得 · 总览]', unknown.nodes.find((node) => node.props?.['data-cl-current-session-summary'] !== undefined))
+
+  push('[字号 · 主档]', nodesOf(nodes.find((node) => node.props?.['data-cl-row'] !== undefined))[0])
+  lines.push(`[字号 · 五档] ${Object.entries(V.FONT_SIZES).map(([k, v]) => `${k}=${v}`).join(' ')}`)
+  lines.push(`[行高 · 四档] ${Object.entries(V.FONT_LINE_HEIGHTS).map(([k, v]) => `${k}=${v}`).join(' ')}`)
+
+  console.log(lines.join('\n'))
+  assert.ok(lines.length >= 13)
+})
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * J 组：契约夹具的**机械保真**与**防漂移指纹**（C4 + C5，R8 / t6）
+ *
+ * 背景：§2.9 / §2.21 的合成示例是**被测试机械抽取**的契约数据。VERIFY-T17 §8.1 曾做过一次
+ * 「解析 DESIGN 的 jsonc 与夹具逐字段比对 → 13/13 SAME」，但那是一次**人工**核验，会静默过期
+ * （VERIFY-T17 §385 的建议）。这里把那次比对变成**常驻测试**：
+ *   ① 从 `DESIGN.md` 现场解析 jsonc 块 → 与夹具 deepEqual（漂移立刻显式变红，且打印差异路径）；
+ *   ② **内容指纹**（sha256 of canonical JSON）钉死（C5）→ 连"改了但恰好等值"的编辑也会被发现；
+ *   ③ A18（§2.19 的升序 / 去重 / ≤3）在 DESIGN 与夹具**两份数据**上都被机械检查，
+ *      并与 `lib/hide.js` 的**实际行为**（`buildHidePlan` 喂乱序输入）对照——同类违规下次会被拦住。
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+/** `DESIGN.md` 原文：夹具保真比对的唯一真源（只读）。 */
+const DESIGN_SRC = readFileSync(join(REPO, 'DESIGN.md'), 'utf8')
+
+/** 从某个小节标题之后抽出第一个 ```jsonc 代码块并解析（解析失败即显式失败，不静默跳过）。 */
+function designJsoncBlock(sectionMarker) {
+  const start = DESIGN_SRC.indexOf(sectionMarker)
+  assert.ok(start > 0, `DESIGN.md 里找不到小节：${sectionMarker}`)
+  const fence = DESIGN_SRC.indexOf('```jsonc', start)
+  assert.ok(fence > 0, `${sectionMarker} 之后找不到 jsonc 代码块`)
+  const end = DESIGN_SRC.indexOf('```', fence + '```jsonc'.length)
+  assert.ok(end > fence, `${sectionMarker} 的 jsonc 代码块未闭合`)
+  const body = DESIGN_SRC.slice(fence + '```jsonc'.length, end)
+  try {
+    return JSON.parse(body)
+  } catch (error) {
+    throw new Error(`${sectionMarker} 的 jsonc 块不是合法 JSON：${error.message}`)
+  }
+}
+
+/** 递归排序键后的规范形式：指纹只取决于内容，与键序 / 缩进 / 空白无关。 */
+function canonicalJson(value) {
+  if (Array.isArray(value)) return value.map(canonicalJson)
+  if (value !== null && typeof value === 'object') {
+    return Object.keys(value).sort().reduce((out, key) => {
+      out[key] = canonicalJson(value[key])
+      return out
+    }, {})
+  }
+  return value
+}
+
+/** 内容指纹：canonical JSON 的 sha256（数组顺序**参与**指纹——排序违规会直接改指纹）。 */
+function fingerprintOf(value) {
+  return createHash('sha256').update(JSON.stringify(canonicalJson(value))).digest('hex')
+}
+
+/**
+ * §2.21 契约块的**内容指纹**（C5）。
+ *
+ * 它是**有意的闸门**：`DESIGN.md` §2.21 或 `R6_EXAMPLE` 夹具只要漂移一个字节（含数组顺序），
+ * J2 就会失败并打印本常量与两侧实际值。若漂移是**有意的契约变更**，必须同一步更新：
+ * ① `DESIGN.md` §2.21、② 本文件的 `R6_EXAMPLE`、③ 本常量。
+ */
+const SECTION_21_FINGERPRINT = 'cc5e143e4399e0cb6878efb9facbed09687d7c9fbe2572a80274bec889ac4a36'
+
+/** 逐字段差异（返回人类可读的路径清单；失败信息里直接给出，避免"只知道不相等"）。 */
+function describeDiffs(design, fixture, path) {
+  const where = path ?? '§2.21'
+  const out = []
+  if (Array.isArray(design) && Array.isArray(fixture)) {
+    if (design.length !== fixture.length) out.push(`${where}: 长度 DESIGN=${design.length} 夹具=${fixture.length}`)
+    for (let i = 0; i < Math.min(design.length, fixture.length); i++) {
+      out.push(...describeDiffs(design[i], fixture[i], `${where}[${i}]`))
+    }
+    return out
+  }
+  if (design !== null && fixture !== null && typeof design === 'object' && typeof fixture === 'object') {
+    for (const key of [...new Set([...Object.keys(design), ...Object.keys(fixture)])]) {
+      if (!(key in design)) out.push(`${where}.${key}: 仅夹具有（${JSON.stringify(fixture[key])}）`)
+      else if (!(key in fixture)) out.push(`${where}.${key}: 仅 DESIGN 有（${JSON.stringify(design[key])}）`)
+      else out.push(...describeDiffs(design[key], fixture[key], `${where}.${key}`))
+    }
+    return out
+  }
+  if (JSON.stringify(design) !== JSON.stringify(fixture)) {
+    out.push(`${where}: DESIGN=${JSON.stringify(design)} 夹具=${JSON.stringify(fixture)}`)
+  }
+  return out
+}
+
+test('J1. C4-夹具保真：DESIGN §2.21 与 R6_EXAMPLE 机械逐字段一致（13/13 SAME）', () => {
+  const design = designJsoncBlock('### 2.21 R6 完整示例')
+  const fixture = R6_EXAMPLE
+
+  /* 13 个比对组：与 VERIFY-T17 §8.1 那次人工核验的口径同构，逐组打印 SAME/DIFF。 */
+  const groups = [
+    ['tool / unit / version', (o) => ({ tool: o.tool, unit: o.unit, version: o.version })],
+    ['items（24 项逐字段）', (o) => o.items],
+    ['hidePlanTokens', (o) => o.findings.hidePlanTokens],
+    ['hidePlanBasis', (o) => o.findings.hidePlanBasis],
+    ['hidePlanStatus', (o) => o.findings.hidePlanStatus],
+    ['hidePlan 条数 / 名字序列 / 各 tokens', (o) => o.findings.hidePlan],
+    ['hidePlanUnits', (o) => o.findings.hidePlanUnits],
+    ['hideApply', (o) => o.findings.hideApply],
+    ['hidePlanCaveat', (o) => o.findings.hidePlanCaveat],
+    ['prunePlan', (o) => o.findings.prunePlan],
+    ['prunePlanReclaimableTokens', (o) => o.findings.prunePlanReclaimableTokens],
+    ['zeroCallBasis', (o) => o.findings.zeroCallBasis],
+    ['noRecommendation', (o) => o.findings.noRecommendation],
+  ]
+  const report = []
+  for (const [label, pick] of groups) {
+    const diffs = describeDiffs(pick(design), pick(fixture), label)
+    report.push(`${diffs.length === 0 ? 'SAME' : 'DIFF'}  ${label}`)
+    assert.deepEqual(diffs, [], `§2.21 契约与夹具漂移（${label}）：\n  ${diffs.join('\n  ')}`)
+  }
+  /* 整块 deepEqual：比 13 组更强——任何**未列入组**的字段漂移也会被发现。 */
+  const whole = describeDiffs(design, fixture, '§2.21(整块)')
+  assert.deepEqual(whole, [], `§2.21 整块漂移：\n  ${whole.join('\n  ')}`)
+  const same = report.filter((line) => line.startsWith('SAME')).length
+  assert.equal(same, 13, '13 个比对组必须全部 SAME')
+  console.log('=== DESIGN §2.21 vs R6_EXAMPLE 逐字段比对 ===\n  ' + report.join('\n  ')
+    + `\n  （整块 deepEqual：${whole.length} 处差异）⇒ ${same}/13 SAME`)
+})
+
+test('J2. C5-防漂移指纹：DESIGN §2.21 与夹具的内容指纹必须等于钉死值', () => {
+  const design = designJsoncBlock('### 2.21 R6 完整示例')
+  const actualDesign = fingerprintOf(design)
+  const actualFixture = fingerprintOf(R6_EXAMPLE)
+
+  const drifted = (side, actual) => `DESIGN §2.21 ${side} 的内容指纹漂移了。\n`
+    + `  期望（钉死）：${SECTION_21_FINGERPRINT}\n  实际：        ${actual}\n`
+    + '这是 C5 的**有意闸门**：若这是有意的契约变更，请**同一步**更新 '
+    + '① DESIGN.md §2.21 的示例、② test/client-panel.test.mjs 的 R6_EXAMPLE 夹具、'
+    + '③ 本文件的 SECTION_21_FINGERPRINT 常量（并跑 J1/J3）；若不是有意变更，请还原。'
+
+  assert.equal(actualDesign, SECTION_21_FINGERPRINT, drifted('DESIGN 示例', actualDesign))
+  assert.equal(actualFixture, SECTION_21_FINGERPRINT, drifted('测试夹具', actualFixture))
+
+  // 指纹机制自检（证明它不是装饰）：值一变必变、数组顺序一变必变
+  const mutated = JSON.parse(JSON.stringify(design))
+  mutated.findings.hidePlanTokens += 1
+  assert.notEqual(fingerprintOf(mutated), SECTION_21_FINGERPRINT, '值改动必须改变指纹')
+  const reordered = JSON.parse(JSON.stringify(design))
+  const subagent = reordered.findings.hidePlan.find((entry) => entry.name === 'subagent')
+  subagent.registryUse.nameReferencedElsewhere.reverse()
+  assert.notEqual(fingerprintOf(reordered), SECTION_21_FINGERPRINT,
+    '数组顺序改动（正是 C4 的那类违规）必须改变指纹')
+
+  // 键序 / 缩进不参与指纹（否则改格式就误报，闸门会变成噪音）
+  const reshaped = {}
+  for (const key of Object.keys(design).reverse()) reshaped[key] = design[key]
+  assert.equal(fingerprintOf(reshaped), SECTION_21_FINGERPRINT)
+  console.log(`=== §2.21 内容指纹 ===\n  DESIGN / 夹具 / 钉死值 = ${SECTION_21_FINGERPRINT.slice(0, 16)}…（三者一致）`)
+})
+
+test('J3. C4-清单 A18：nameReferencedElsewhere 升序去重且 ≤3（DESIGN 与夹具同时受检）', () => {
+  const design = designJsoncBlock('### 2.21 R6 完整示例')
+  const evidence = []
+
+  for (const [label, block] of [['DESIGN §2.21', design], ['R6_EXAMPLE', R6_EXAMPLE]]) {
+    const entries = block.findings.hidePlan
+    assert.equal(entries.length, 24, `${label}: hidePlan 应为 24 条`)
+    for (const entry of entries) {
+      const list = entry.registryUse.nameReferencedElsewhere
+      assert.ok(Array.isArray(list), `${label}/${entry.name}: 必须是数组`)
+      assert.ok(list.length <= 3, `${label}/${entry.name}: 长度必须 ≤3（§2.19 / A18）`)
+      assert.deepEqual([...list], [...list].sort(),
+        `${label}/${entry.name}: 必须升序（§2.19 / A18；默认 sort = 码元序）`)
+      assert.deepEqual([...list], [...new Set(list)], `${label}/${entry.name}: 必须去重（A18）`)
+      for (const filePath of list) {
+        assert.match(filePath, /^\//, `${label}/${entry.name}: 弱命中必须是绝对路径`)
+      }
+    }
+    const nonEmpty = entries.filter((entry) => entry.registryUse.nameReferencedElsewhere.length > 0)
+    assert.deepEqual(plain(nonEmpty.map((entry) => entry.name)), ['subagent'],
+      `${label}: 示例中唯一非空项应是 subagent（A18 的取证点）`)
+    evidence.push(`${label}: ${nonEmpty[0].registryUse.nameReferencedElsewhere
+      .map((filePath) => filePath.slice(filePath.indexOf('node_modules/'))) 
+      .join(' → ')}`)
+  }
+
+  /* A18 的取证点被钉住：C4 修正后的升序必须是 @linxin666/… 先于 @nanmicoder/… */
+  const subagent = design.findings.hidePlan.find((entry) => entry.name === 'subagent')
+  assert.ok(subagent.registryUse.nameReferencedElsewhere[0].includes('@linxin666/dsh-session-archive'),
+    'C4 修正后的 §2.21 示例：@linxin666/… 必须排在 @nanmicoder/… 之前（升序）')
+  assert.ok(subagent.registryUse.nameReferencedElsewhere[1].includes('@nanmicoder/dsh-agent-teams'))
+
+  /* 与**实现侧实际行为**对照（A18 不得写一条实现做不到的断言）：
+   * `lib/hide.js` 的 `uniqueSorted(weakEvidence[name]).slice(0, NAME_REFERENCED_LIMIT)`。 */
+  assert.equal(NAME_REFERENCED_LIMIT, 3, 'A18 的 ≤3 必须等于实现侧的 NAME_REFERENCED_LIMIT')
+  const scrambled = ['/z/last.js', '/a/first.js', '/m/middle.js', '/a/first.js', '/b/second.js']
+  const built = buildHidePlan(
+    [{
+      id: 'tools:scrambled_tool', category: 'tools', name: 'scrambled_tool', tokens: 100, calls: 0,
+      zeroCall: true, usageBasis: 'tool-calls', source: 'native',
+      providedBy: { kind: 'core', name: null, confidence: 'high', method: 'static-scan', evidenceFile: null, candidates: [] },
+    }],
+    { byName: {}, bundleOwners: {}, weakEvidence: { scrambled_tool: scrambled } },
+    { restrictableNames: ['scrambled_tool'], interfacePresent: true },
+  )
+  assert.equal(built.hidePlan.length, 1)
+  assert.deepEqual(plain(built.hidePlan[0].registryUse.nameReferencedElsewhere),
+    ['/a/first.js', '/b/second.js', '/m/middle.js'],
+    'A18：实现把乱序 / 重复输入排成升序去重并截断到 3（实测行为与清单一致）')
+  console.log('=== A18 升序取证 ===\n  ' + evidence.join('\n  ')
+    + '\n  实现实测（乱序+重复输入）→ ' + JSON.stringify(plain(built.hidePlan[0].registryUse.nameReferencedElsewhere)))
+})
+
+test('J4. v4 下游漂移：DESIGN §2.9 与 canonicalReport 夹具逐字段一致', () => {
+  const design = designJsoncBlock('### 2.9 完整示例 JSON')
+  const fixture = canonicalReport()
+  const diffs = describeDiffs(design, fixture, '§2.9')
+  assert.deepEqual(diffs, [], `§2.9 契约与面板夹具漂移：\n  ${diffs.join('\n  ')}`)
+  /* item 4 的两处定点（t1 的合成数据自洽修正）：两处副本都必须与 DESIGN 同值。 */
+  assert.equal(fixture.scope.sessionsUnreadable, 0)
+  assert.equal(fixture.scope.sessionsOutsideWindow, 21)
+  assert.equal(fixture.scope.sessionsAvailable,
+    fixture.scope.sessionsScanned + fixture.scope.sessionsUnreadable + fixture.scope.sessionsOutsideWindow,
+    'W4：41 = 20 + 0 + 21')
+  console.log('=== DESIGN §2.9 vs canonicalReport 逐字段比对 ===\n  SAME（0 处差异）'
+    + `；sessionsUnreadable=${fixture.scope.sessionsUnreadable} / sessionsOutsideWindow=${fixture.scope.sessionsOutsideWindow}`)
+})
+
+

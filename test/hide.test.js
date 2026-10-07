@@ -15,7 +15,7 @@ import { readFileSync } from 'node:fs'
 import {
   HIDE_MODES, HIDE_PLAN_BASIS, HIDE_PLAN_CAVEAT, NAME_REFERENCED_LIMIT, NON_MODEL_CALLERS,
   PRECHECK_REASONS, PRECHECK_STATUSES, REGISTRY_USE_BASIS, REGISTRY_USE_VERDICTS,
-  RESERVED_TOOL_NAMES, buildHideApply, buildHideFindings, buildHidePlan, precheckOf,
+  RESERVED_TOOL_NAMES, buildHideApply, buildHideFindings, buildHidePlan, normalizeNameCollection, precheckOf,
 } from '../lib/hide.js'
 
 const PROVIDED = {
@@ -232,4 +232,52 @@ test('§3.4 grep 判据：lib/hide.js 是纯函数模块（不读盘、不 impor
     assert.equal(code.includes(forbidden), false, `lib/hide.js 不得出现 ${forbidden}`)
   }
   assert.equal(/^import .*@deepseek-ai/m.test(code), false, 'lib/hide.js 不得 import 宿主包')
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// t18 / B1：宿主返回的是 Set（不是 Array）——纵深防御与兼容性
+// ─────────────────────────────────────────────────────────────────────────────
+
+test('B1 · normalizeNameCollection：Set 与 Array 都接受，非集合形状返回 null', () => {
+  assert.deepEqual(normalizeNameCollection(new Set(['bash', 'read'])), ['bash', 'read'])
+  assert.deepEqual(normalizeNameCollection(['bash', 'read']), ['bash', 'read'])
+  // 非字符串元素被过滤（宿主集合里只会有名字，但边界要定死）
+  assert.deepEqual(normalizeNameCollection(new Set(['bash', 42, null])), ['bash'])
+  assert.deepEqual(normalizeNameCollection([]), [])
+  assert.deepEqual(normalizeNameCollection(new Set()), [])
+  for (const value of [undefined, null, {}, new Map([['bash', true]]), 'bash', 42, true]) {
+    assert.equal(normalizeNameCollection(value), null, `${String(value)} 不是名字集合`)
+  }
+})
+
+test('B1 · precheckOf：Set 型 restrictableNames 不得被静默当空集合', () => {
+  const probe = { status: 'prechecked', restrictableNames: new Set(['a_tool']) }
+  assert.deepEqual(precheckOf('a_tool', probe), { status: 'prechecked', restrictable: true, reason: null })
+  assert.deepEqual(precheckOf('b_tool', probe), {
+    status: 'prechecked', restrictable: false, reason: 'not-in-restrictable-names',
+  })
+  // 数组（旧替身形态）语义完全相同
+  const asArray = { status: 'prechecked', restrictableNames: ['a_tool'] }
+  assert.deepEqual(precheckOf('a_tool', asArray), { status: 'prechecked', restrictable: true, reason: null })
+})
+
+test('B1 · buildHidePlan/buildHideApply：Set 型预校验来源下 denyList 必须非空', () => {
+  const items = [
+    item('a_tool', 100, PROVIDED.pluginA),
+    item('b_tool', 50, PROVIDED.coreTool),
+  ]
+  // 宿主真机形态：Set
+  const fromSet = buildHideFindings(items, { byName: PROVIDED, bundleOwners: BUNDLES }, {
+    status: 'prechecked', restrictableNames: new Set(['a_tool', 'b_tool']), interfacePresent: true,
+  })
+  assert.equal(fromSet.hidePlanStatus, 'prechecked')
+  assert.deepEqual(fromSet.hideApply.denyList, ['a_tool', 'b_tool'])
+  assert.deepEqual(fromSet.hideApply.skipped, [])
+  assert.equal(fromSet.hideApply.applySupported, true)
+  // 同一个集合写成数组时结果逐字节相同（兼容性回归：修法只是"多接受一种类型"）
+  const fromArray = buildHideFindings(items, { byName: PROVIDED, bundleOwners: BUNDLES }, {
+    status: 'prechecked', restrictableNames: ['a_tool', 'b_tool'], interfacePresent: true,
+  })
+  assert.deepEqual(fromArray.hideApply, fromSet.hideApply)
+  assert.deepEqual(fromArray.hidePlan, fromSet.hidePlan)
 })

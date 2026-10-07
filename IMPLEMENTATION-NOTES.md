@@ -504,3 +504,275 @@ R6 不读任何新目录、不读会话正文、不解析别人配置（§2.25 �
 1. `ctx.sidebarRight` **不可用时必须回退**到既有 popover，**不得抛错、不得让控件变死按钮**（老宿主 / headless）。
 2. **不得把旧 popover 改名冒充侧栏**——复核线 t21 的首要任务就是真伪判别（注册进真插槽 + 真调用 `openTab`）。
 3. 措辞红线在**新位置重验**：tab 标题与属性型文本（`title`/`aria-label`/…）是新增的逃逸口，必须一并穷举。
+
+---
+
+## t18 / B1 · `restrictableNames` 的真实类型是 `Set`（真机不可用级缺陷 · 已修复）
+
+**发现方**：t16 验证线（`VERIFY-T16.md` B1），队长复核确认后由用户授权发起修复轮。
+
+### 事实（一手只读核对，`/opt/dsh/node_modules/@deepseek-ai/dsh/**` 未改）
+
+| 处 | 宿主源码 | 结论 |
+|---|---|---|
+| 构造 | `dsh-tools/lib/index.js:2969` `const restrictableNames = new Set()` | 是 **Set** |
+| 放进 `view()` | 同文件 `:2983`（`return { visible, knownNames, restrictableNames }`） | 返回 **Set** |
+| 宿主自己消费 | 同文件 `:2906` `const known = this.view(scope).restrictableNames;` + `!known.has(name)` | 用 `.has()`，Set 语义 |
+
+（同族形状：`view()` 的 `visible` 是 `Map`、`knownNames` 是 `Set`。）
+
+### 缺陷与后果
+
+`index.js` 的 `probeRestrict` 用 `Array.isArray(view(agent).restrictableNames)` 判定接口可用性，
+`lib/hide.js` 的 `precheckOf` 同样只认数组 ⇒ 真机上**恒判 `unsupported`**：
+`hidePlanStatus` 恒 `unsupported`（§2.23.3 的 `prechecked` 行不可达）、`restrictable` 恒 `null`、
+**`denyList` 恒 `[]`**、`interfacePresent` 谎报 `false`、`skipped[].reason` 全标 `interface-absent`，
+`hide.apply: true` 也不会施加任何名字（**H2 在真机不可达**）。R6 的核心交付物（可粘贴 deny 清单）是真机死代码。
+
+### 修法（只改实现与夹具，不改契约语义）
+
+1. `lib/hide.js` 新增并导出 `normalizeNameCollection(value)`：
+   `Set → [...value]`、`Array → value`（都只保留字符串），其它形状 → `null`（= 拿不到集合）。
+   `precheckOf` 改用它（纵深防御：只认数组会把整个集合静默当空）。
+2. `index.js` 的 `probeRestrict` 改用它：拿得到集合 ⇒ `prechecked` + `interfacePresent: true`；
+   拿不到（`undefined` / 普通对象 / `Map` / 字符串）⇒ `unsupported`。**Set 与 Array 都接受**，
+   因此修复是"多接受一种类型"的超集，数组型旧替身行为逐字节不变。
+3. **测试夹具以宿主为准**：`test/host.test.js` 的 `makeFakeTools` 默认把名字集合包成 **`Set`**，
+   并按宿主同形返回 `{ visible: Map, knownNames: Set, restrictableNames: Set }`；
+   只有显式 `namesType: 'array'` 时才给数组（留一条兼容性回归）。
+
+### 根因（本轮最该记住的一条）：夹具自洽 ≠ 实现与宿主一致
+
+旧夹具**自己造了一个数组型接口**，于是"实现 ∝ 夹具"两边自洽、套件全绿，
+而不一致恰恰发生在"实现 ↔ 宿主"之间——那是"自己造接口"的测试在**结构上够不到**的地方。
+**"套件全绿"只证明实现与夹具一致，不证明实现与宿主一致。**
+
+### 由此新增的机械防线（t18）
+
+1. **夹具对拍宿主源码**：`test/host.test.js` 新增用例，直接 `require.resolve('@deepseek-ai/dsh-tools')`
+   读宿主源码（只读），断言 `const restrictableNames = new Set()`、它被放进 `view()` 返回值、
+   宿主自己用 `!known.has(name)` 消费，并断言**默认夹具给出 `Set`**（`visible` 是 `Map`、`knownNames` 是 `Set`）。
+   宿主将来若改成数组，这条会**显式失败**，而不是让套件继续绿。
+2. **类型回归三件套**：`Set ⇒ prechecked + interfacePresent=true + denyList 非空`；
+   `Set 下 opt-in 施加真的下发名字`（证明 H2 在真机类型下可达）；
+   `Array 兼容性回归`（旧形态仍 work）；另有"非集合形状（`Map`/普通对象/`undefined`/字符串/数字）不得被判为可用接口"。
+3. 纯函数层同款：`test/hide.test.js` 覆盖 `normalizeNameCollection` 与"Set 不得被静默当空集合"。
+
+### 宿主 API 返回值类型普查（同类隐患一次扫清）
+
+| 消费点 | 宿主真实类型（一手源码/类型声明） | 实现现状 |
+|---|---|---|
+| `tools.view(scope).restrictableNames` | **`Set`**（`dsh-tools/lib/index.js:2969`/`:2983`/`:2906`） | **本轮修复**：`Set` 与 `Array` 都接受 |
+| `tools.view(scope).{visible,knownNames}` | `Map` / `Set`（同文件 `:2962-2985`） | 未被消费（夹具仍按同形造，便于未来消费） |
+| `tools.schemas(scope)` | `Array`（`:3023-3024` `[...values()].map(...)`） | `Array.isArray` 守卫**正确**，保持 |
+| `skills.list(options)` | `Array`（`dsh-skill/lib/index.js:224-225` `(await snapshot()).skills`） | `Array.isArray` 守卫**正确**，保持 |
+| `tools.restrict({deny})` | 返回解除器函数（`:2909`） | 忽略返回值（effect 随插件卸载释放，§2.24.1） |
+| `ctx.fs.resolve/processPath/stat/readText` | `FsTarget` / `string` / `FsInfo{version,type:'file'|'directory'|'other',size?}` / `string`（`dsh-fs` 类型声明） | 只消费 `type`/`size`，**正确** |
+| `ctx.on('agent/created', payload)` | `{ agent, ... }`（`dsh-agent/lib/index.js:579-580`） | 解构 `{ agent }`，**正确** |
+| `ctx.get('profileContext')` | `{ name, dir, home, ... }`（`dsh-app-boot` 类型声明） | 只消费 `dir`（字符串），**正确** |
+| `ctx.get('sessions').get(id)` / `agents.get(id)` | 会话对象（`.header.cwd`）/ agent | 只消费 `header.cwd` 字符串，**正确** |
+
+结论：本族隐患**只有 `restrictableNames` 一处**，已修复；其余消费点的类型都已按宿主源码/类型声明核对。
+
+---
+
+## 队长裁定 · t20 交付后两条（2026-10-07）
+
+**裁定 A · `package.json` 的 `dsh.client.inject` 不补 `@deepseek-ai/dsh-client-ui-sidebar-right` —— 刻意不加。**
+t20 建议补上（两个先例 `agent-teams` / `dsh-context` 都列了），并说明"不依赖它也能工作"。队长核实了该字段的语义：`dsh-client-modules/lib/client.js:66` 读取 `dsh.client.inject`，`:208` 把它作为注入需求传入——它是**依赖声明**，不是顺序提示。
+**判定依据**：本插件的硬性设计目标是"`ctx.sidebarRight` 不可用时优雅降级到就地浮层"（t20 的验收硬项之一）。把它写进静态 `inject` 会把**可选集成变成硬依赖**——缺该包的 profile 会因此加载失败，正好摧毁降级。可选依赖的正确声明方式就是 t20 已经用的 `ctx.inject(['sidebarRightTabs'], cb)` 惰性注入。
+**推翻条件**：若将来发现侧栏服务面**必须**经过静态 `inject` 才能在调度上就绪（而非仅是可选项），则改为补上，并同时放宽降级要求——**两者不能同时要**。
+
+**裁定 B · 新增承载位置必须做运行时验证，不能用"静态 + 结构化断言"了事。**
+t20 报告"无浏览器内 E2E（守不启动 web 服务纪律）"。队长**不接受以此结案**，已在 t21 追加硬要求：在**工作区内隔离 `DSH_HOME`** 下以**受管后台作业**启动 web 实例，确认右侧栏 tab 类型与两个座位被宿主接受、且 `openTab` 在不抛错的前提下真的展开该栏；结束后必须终止并确认端口关闭。
+**依据**：本插件 v1 的**必崩缺陷**（含 hook 的组件被当普通函数调用且在条件分支内）正是穿过了三份报告合计 1000+ 条断言才被 R2 顺带发现的——那些验证**从未在浏览器里真正展开过面板**。本次是**新增承载位置**，属同一类未覆盖风险。
+**纪律例外边界**：允许启动 web 实例，但**仅限工作区内隔离 `DSH_HOME`**；绝不使用真实 `~/.dsh` 托管服务；不得留下常驻进程。
+
+**附带确认 · t20 的 popover 处置**：保留为**回退**（未移除）。有右侧栏时点击不再弹它；服务不可用/开栏失败（老宿主、headless、无在屏会话、类型被抢、HMR 撤下）时它立刻接管，控件永远不是死按钮。队长**接受**该处置——它同时满足"点控件即开右侧栏"与"任何情况下都不是死按钮"两项要求。
+
+---
+
+## 界面决定备案 · 面板字号对齐 DSH `--dsw-font-*` 阶梯（R8 / t1，2026-10-07）
+
+**性质**：本条是**界面决定备案**，不是设计变更、**不进 `DESIGN.md` 的冻结契约**
+（§4.1 只要求"沿用宿主 CSS 变量、不硬编码配色"；字号无字段、无义务、无断言）。
+
+**触发（用户直接反馈）**：本插件面板字号明显小于 `dsh-annotate`（后者 12px）。
+
+**实测（t1 一手核对，未改任何受限路径）**：
+
+- `client.js` 共 43 处 `fontSize`，分布：`9.5`×3、`10`×6、**`10.5`×18**、`11`×4、`11.5`×7、`12`×3、`13`×1、`20`×1。
+  主力 **10.5px**，**低于 DSH 宿主自己的最小档 `--dsw-font-xxxs-11`**——即本插件比宿主的最小正文还小。
+- DSH checkout（只读）中确实存在该 token 阶梯与 `-font-size` 后缀形式：
+  `--dsw-font-xxxs-11`、`--dsw-font-xxs-12`、`--dsw-font-xs-13`、`--dsw-font-s-14`、`--dsw-font-l-20`，
+  以及 `--dsw-font-xxxs-11-font-size` 等派生变量（`grep -rho -- "--dsw-font-[a-z0-9-]*"` 全量计数：
+  `xs-13` 39 / `xxs-12` 16 / `xxxs-11` 6 / `s-14` 2 / `l-20` 2）。
+
+**决定**：面板字号**对齐宿主 token 阶梯**，取值形式用
+`var(--dsw-font-xxs-12-font-size, 12px)`（带 fallback，跟随主题变量；不写裸 px，也不自定义字号常量）。
+
+| 现状 px | 出现次数 | 映射到 | 写法 |
+|---|---|---|---|
+| 9.5 | 3 | 11 | `var(--dsw-font-xxxs-11-font-size, 11px)` |
+| 10 | 6 | 11 | 同上 |
+| **10.5** | **18** | **12** | `var(--dsw-font-xxs-12-font-size, 12px)` |
+| 11 | 4 | 12 | 同上 |
+| 11.5 | 7 | 13 | `var(--dsw-font-xs-13-font-size, 13px)` |
+| 12 | 3 | 13 | 同上 |
+| 13 | 1 | 14 | `var(--dsw-font-s-14-font-size, 14px)` |
+| 20（总览数字/标题档） | 1 | 20（保持） | `var(--dsw-font-l-20-font-size, 20px)` |
+
+**边界（三条，防止顺手扩张）**：
+1. 只改字号，**不得**改动任何文案键名、键值、颜色、间距或信息义务（本插件只报事实这条不受影响）；
+2. 行高/字重如随字号调整，属同一备案的自由裁量（D2/D6），但**不得**引入自定义字号常量或魔法数覆盖宿主 token；
+3. 该改动落在**面板线**（`client.js` / `test/client-panel.test.mjs`），与归属、省额、三态等数据语义无关。
+
+**归属**：面板实现线。**不要求**为此刻意开一轮契约修订（DESIGN 无需改动）。
+
+---
+
+## R8（v4）设计↔实现交接（t1 设计轮，2026-10-07）
+
+**性质**：本小节记录 `DESIGN.md` 升到 v4（R8：三态调用口径 + 窗口边界显式化 + 收口 C1/C2/C3/C6）之后，
+留给**实现线 / 面板线**的交接事项。本文件仍为 **append-only**。
+
+### 交接 1 · 这版是"契约追上代码"，也是"契约扩出一个新维度"
+
+- **追上代码**（C1/C2/C3/C6，本轮已收口，见 `DESIGN.md` §8 的 B 节）：
+  §7.1 现在逐字段描述了实现**早已在用**的输入通道（`provenance.weakEvidence`、顶层
+  `hide{status,restrictableNames,mode,interfacePresent,appliedNames}`），并**一并收口 F2**；
+  §2.11 采信了 F7 记录的 6/7 行 R6 渲染段（**逐字，未重新措辞**）；§4.5 采信了 v3 的 45 个 `cl.hide*` 键；
+  §4.1/§4.8 追认了右侧栏承载位置。**这四项不要求实现改任何语义**，只需按契约核对。
+- **新维度**（R8 新能力）：`items[].currentSessionCalls` / `sessionsWithCalls` / `callPresence`、
+  `scope.currentSession` / `windowBasis` / `sessionsOutsideWindow`、`totals.currentSessionObservedCalls`、
+  `findings.zeroCallBasis`，`version` 3 → 4。**这一项需要实现线与面板线施工**，施工清单见
+  `DESIGN.md` §8 的「v4 的下游影响」。
+
+### 交接 2 · 实现线最容易写错的三处（逐条对应 DESIGN 的硬规则）
+
+1. **`{}` 与 `null` 不是一回事**（§7.1 规则 6）：`sessionCoverage` / `currentSessionCallsByName`
+   传 `{}` 表示"已判定、确实一个都没有"（⇒ 输出 `0`）；传 `null`（或缺字段）表示"给不出"（⇒ 输出 `null`）。
+   把"缺通道"当成"零"会凭空造出零调用——这是本版最危险的一处。
+2. **本会话不在窗口内时一律 `null`，不是 `0`**（§2.26.2 判定表行 4/5）：`scope.currentSession.inWindow === false`
+   ⇒ 逐项 `currentSessionCalls = null`、`callPresence = null`、`totals.currentSessionObservedCalls = null`。
+3. **窗口边界只能来自日志文件 `mtime`**（§2.2 第 4 条 / §3.8 第 1 条）：**不**读行内 `time`、
+   **不**为"最近一次调用时间"新增字段；`sessionsScanned ≥ 1` 时 `windowStart`/`windowEnd` **不得**为 `null`。
+
+### 交接 3 · §2.9 合成示例有一处数值改动（夹具需同步）
+
+为满足新增不变量 W5（`sessionsScanned + sessionsUnreadable ≤ sessionsLimit`），
+`DESIGN.md` §2.9 的 `scope.sessionsUnreadable` 由 `1` 改为 `0`（其余数字不变；新增 `sessionsOutsideWindow: 21`，
+使 W4 成立：`41 = 20 + 0 + 21`）。**引用该值的测试夹具需同步**（`test/reconcile.test.js`、
+`test/client-panel.test.mjs` 的 `canonicalReport()` 等，见 §8 下游影响）。这条是**合成数据的自洽修正**，
+不改变任何语义。
+
+### 交接 4 · 面板线（与本轮并行施工的 t3 的边界）
+
+- v4 的窗口口径**不靠改既有键取值**实现（`cl.zeroCallTitle` 等**一律不动**），只新增 9 个键
+  （`DESIGN.md` §4.5 的 v4 清单）——这样 t3 已上屏的文案与冻结值断言都不会被击穿。
+- `historical-only` **不得**使用零调用样式，**不得**进 `zeroCall`/`prunePlan`/`hidePlan` 三段
+  （§4.9 第 6 条）；`currentSessionCalls === null` **不得**渲染成 `0`（§4.4 的 v4 硬规则①）。
+
+### 交接 5 · 携带项终态（与 `DESIGN.md` §8 的 B 节一致；"延期"有名有主）
+
+| 项 | 终态 |
+|---|---|
+| C1（§7.1 输入通道，阻塞级）· C2（§2.11 R6 渲染段）· C3（§4.5 的 45 键）· C6（右侧栏位置） | **本轮已收口**（位置见 §8 B 节表格） |
+| **C4**（§2.21 示例违反 §2.19 升序 + A 清单不完整） | **本轮不做，已排期**：§2.21 的示例与 A1–A17 被面板测试**机械抽取**，DESIGN 与那份测试必须**同一步**改；本轮有面板线（t3）在跑，现在动会造成跨线门禁污染。**排期：t3 收敛之后的后续任务** |
+| **C5**（§2.21 夹具加内容指纹，防静默漂移） | **本轮不做，已排期**：与 C4 并入同一个后续任务 |
+| **C7（t1 新提出）· native 渲染仍未把窗口口径写进文本** | **本轮不做，已排期**（见下）。理由：§2.11 刚刚按 C2 完成"**逐字**提升"，同一版里再改既有行会让"逐字"这条要求变浑；且该改动会击穿 `renderLedger` 的既有行断言，属宿主线工作。**但它不是注释式待办**——确切文案已钉在下面，下一个实现任务照抄即可 |
+
+**C7 的确切文案（机械提升，不得重新措辞；`lib/reconcile.js` 的 `renderLedger`）**：
+
+1. 第 1 行由
+   `Context ledger: <residentTokens> tokens resident / <observedCalls> observed calls across <sessionsScanned> sessions / <perUse> tokens per use`
+   改为
+   `Context ledger: <residentTokens> tokens resident / <observedCalls> observed calls across <sessionsScanned> of <sessionsAvailable> sessions (<windowStart> -> <windowEnd>) / <perUse> tokens per use`
+2. 零调用段标题行由
+   `Never called by the model (cost without model use): …`
+   改为
+   `Never called by the model in the scanned window (cost without model use): …`
+3. `scope.sessionsOutsideWindow > 0` 时，紧接零调用段最后一行追加固定一行：
+   `  (<N> earlier sessions were not scanned; raise the "sessions" parameter to cover more)`
+4. 三态**不**进 native 渲染（模型半区从 canonical JSON 的 `items[]` 直接读三态；渲染只负责窗口口径）。
+   **理由**：渲染是摘要，逐项三态会让文本行数翻倍；而 §2.10 的描述已明确告知窗口口径与"0 calls 是窗口内结论"。
+
+---
+
+## 队长裁定 · R8 宿主半区（t2）交付复核与 F8–F14 备案（2026-10-07）
+
+### 队长独立复核（未采信自述）
+- **"未知 ≠ 0"真的落地了（本轮最高优先项）**：`test/e2e.test.js:189` 的断言消息本身就在防这件事——
+  `assert.equal(item.currentSessionCalls, null, \`${item.id} 本会话不可判定却给了数字\`)`；
+  `:192` 同理守 `sessionsWithCalls`。另有 `test/host.test.js:221/262/274/374` 多处覆盖。
+  **这不是"代码里写了 null"，而是"有人专门断言了它不能变成数字"。** 通过。
+- 全量套件 **175/175 全绿**（t3 面板落地后）；宿主侧 120 用例另单独连跑 10/10。
+- 改动范围：7 个 inScope 文件；`lib/usage.js` 等成本/归属模块**零改动**（这是"同源读取"最有力的旁证——覆盖会话数没有靠新读一遍文件实现）。
+- 隐私：禁止字段仅出现在注释；未读任何行内时间戳。通过。
+
+### 裁定 A · HTTP 路由缓存键并入 `sessionId` —— **接受，且它本来就该做**
+t2 主动申报这是它改动中唯一的"额外修复"，并问是否该走决策信封。
+**裁定：接受，且不需要回退。** 理由：不并 `sessionId`，同一工作区的两个会话会互相读到对方的"本会话调用数"——那就是 §5 明令禁止的**同源分歧**（同一次产出的两份副本不一致）。它不是"额外功能"，而是**本轮新功能的正确性前提**：没有它，`currentSessionCalls` 这个新维度在路由路径上是**错的**。
+**关于决策信封**：这属于"为保证新契约正确性所必需、且不改变任何既有字段语义"的改动，落在信封内。t2 主动申报的行为是对的——**申报比沉默好，即使结论是"不必上报"。**
+
+### 裁定 B · F8–F14 备案 —— **全部接受**，并记录在此（t2 因 `IMPLEMENTATION-NOTES.md` 不在其 inScope 而**未**自行追加）
+**队长对 t2 的克制表示认可**：它宁可少动也不越线，把待补要点写在 output 里等授权。这里由队长代录，逐条如下（均可在验证轮直接复核）：
+
+| # | 内容 | 裁定 |
+|---|---|---|
+| F8 | native 渲染按 §8 的 C7 **有意未改** | 接受（C7 已排期，见上文 handoff 5） |
+| F9 | §2.10 里的 `**` 是 markdown 粗体、**未**进文案 | 接受 |
+| F10 | 非法 `currentSession.id` **不**自增 `namesRejected` | 接受。理由：`namesRejected` 属 §2.2 的**工具调用记账**恒等式（`toolCalls = Σcalls + callsUnmatched + namesRejected`）；拿它记"会话 id 校验失败"会污染该恒等式。**不同语义的量不得挤进同一个计数器。** |
+| F11 | 缺覆盖通道时 `sessionsWithCalls=null`（§7.1 规则 6 优先于 §2.26.2 行 5 的 `0`） | 接受。这是"**宁少报不假报**"——与本迭代的最高优先项同一条原则 |
+| F12 | `inWindow` 与通道冲突时取 `false`（I4 硬等价） | 接受。可机械验证的硬约束优先 |
+| F13 | `sessionsScanned===0` 时传 `null` 而非 `{}` | 接受。"没有数据"与"数据为空对象"是两回事 |
+| F14 | 路由缓存键并入 `sessionId` | 接受（见裁定 A） |
+
+**F10/F11/F12 的共同取值原则（队长背书，供后续复用）**：
+> 当契约内部两处表述张力时——**可机械验证的硬约束（恒等式、I4 等价）优先**；
+> 其余情形**宁少报不假报**：给 `null` 而不给一个会被读成事实的 `0`。
+这与本插件自始至终的立场一致：**把"未知"和"已知"分开，是这个插件存在的全部理由。**
+
+---
+
+## 队长裁定 · R8 面板半区（t3）交付复核与 A/B/C 备案（2026-10-07）
+
+### 队长独立复核（未采信自述）
+- 面板套件 **55/55 全绿**（我实跑）；全量 **175/175**。
+- 三态确实上屏：`client.js` 中三态字段出现 **17 处**。
+- **字号改造做对了**：我 grep `fontSize: *[0-9.]*` 在所有 55 处声明上**匹配不到数字**——即**零硬编码像素**，全部走 `var(--dsw-font-…)`；且 `xxxs-11`/`xxs-12`/`xs-13`/`s-14`/`l-20` 每档都**成对**带 `-line-height`。这满足"不得留硬编码像素"的验收要求，并且**跟随主题缩放**——硬编码做不到这一点。
+- 未删/未放宽/未改写任何既有判据（46 项既有用例原样）。通过。
+
+### 裁定 · t3 报的三处契约观察 —— **三处都接受 t3 的处置，其中 C 是契约自身的缺陷**
+
+**A（§4.9#4 要的措辞没有承载键）与 B（`sessionsWithCalls=null` 的"不可判定"没有维度文案键）—— 接受"同义复用既有键"。**
+理由与 R6 那轮我批"复用 v2 同义键"一致：**为同一语义另立同义键会带来漂移风险**（一处改了另一处没改）。t3 用 `cl.unknown` 渲染中性灰徽标、并保证**不显示 0/20**，实质正确。
+**但这暴露了契约的一个缺口**：§4.9 提出了文案义务，§4.5 却没有对应键。**这不是 t3 的问题，是 v4 的记账不全**——记为后续 DESIGN 修订项（见下 C8）。
+
+**C（§4.2 第 3 段 vs §4.5 冲突）—— 接受 t3 的选择，并确认这是 v4 的契约自相矛盾。**
+- §4.2 第 3 段要求"零调用段标题须写明窗口口径"；
+- §4.5 同时冻结"既有键取值一律不动"。
+- 两条**不可能同时满足**（标题就是既有键 `cl.zeroCallTitle`）。
+**t3 选择遵守 §4.5**（更具体、更显式的冻结），把窗口口径改由段底 `cl.windowScope`/`cl.windowOmitted` 承担——**它把意图实现了，只是不落在标题上**。队长接受。
+**裁定：矛盾在我这边（t1 同版既新增 §4.2 ¶3 又冻结 §4.5），须记名修订。**
+
+### 新增携带项 C8（记名、有确切内容、有排期依据）
+**内容**：修 DESIGN §4.2 第 3 段与 §4.5 的冲突，并补齐 §4.9 的两处文案承载键（观察 A/B）。
+**两条可选修法（下一次 DESIGN 修订二选一，不得悬空）**：
+1. 把 §4.2 第 3 段从"标题须写明"放宽为"**段内**须写明窗口口径"——承认既有实现（段底承担）；
+2. 或明示授权 `cl.zeroCallTitle` 的这一次取值变更，并同步 §4.5 的冻结语义。
+**排期依据**：属契约文本修订，不阻塞任何实现；但与 **C4/C5/C7 同批**处理最省——它们都是"契约与已交付现实的记账对齐"。**不得再降级为注释式待办。**
+
+---
+
+## 队长规则 · A/B 基线必须钉死到不可变引用（2026-10-07，由 t4 复确认发现）
+
+**规则**：仓库里任何"新旧对比"的检查（测试内的 A/B、复核脚本的 A/B、断言强度对比、词典对比），**一律把旧版基线钉死到一个不可变引用**（具体 commit sha，或 tag）；**禁止用 `git HEAD` 代表"旧版"**。
+
+**为什么**（t4 复确认时的实测）：工作成果**一旦被提交**，`git HEAD` 就变成**新**版本身——于是"拿 HEAD 当旧版"的比较退化为**自己和自己比**，**恒等通过**。
+t4 当时发现有三处退化（harness2 的断言强度与范围两处、harness4 的词典 A/B），已全部改为钉死 `3f8daf7` 复跑全绿。
+
+**这条为什么危险**：它不是"检查失败"，而是**检查静默失效**——结果依然全绿，但已经什么都证明不了。**静默失效的门禁比会红的门禁危险得多**，因为它会让人把"没验"当成"验过了"。
+（这与本项目此前记录过的"夹具与实现自洽却与宿主不一致"、"测试读了另一条线正在改的文件"同属一类：**门禁看似在跑，实际已不覆盖它声称覆盖的东西。**）
+
+**维护要求**：新增任何 A/B 检查时，基线必须写成一个**显式常量**（并在注释里说明它锚定的是哪个提交与哪次变更），不得写成 `HEAD`。

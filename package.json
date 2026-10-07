@@ -1,18 +1,27 @@
 {
   "name": "dsh-context-ledger",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "DSH 上下文账本：把每个请求常驻注入的 token 成本，与实际调用次数对账，找出「贵且没用」的注入物。只读，零第三方依赖。",
   "license": "MIT",
   "author": "RSoulYu",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/RSoulYu/dsh-context-ledger.git"
+  },
+  "homepage": "https://github.com/RSoulYu/dsh-context-ledger",
+  "bugs": "https://github.com/RSoulYu/dsh-context-ledger/issues",
   "keywords": [
     "dsh",
     "deepseek-harness",
     "plugin",
     "context",
     "token",
-    "audit"
+    "audit",
+    "context-engineering",
+    "tool-schema",
+    "mcp"
   ],
   "exports": {
     ".": "./index.js",
@@ -24,7 +33,9 @@
     "client.js",
     "lib",
     "cordis.patch.yml",
-    "README.md"
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
   ],
   "dsh": {
     "bundle": {

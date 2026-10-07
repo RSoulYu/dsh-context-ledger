@@ -14,7 +14,7 @@
 import test, { after } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { createReadStream, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createInterface } from 'node:readline'
@@ -37,6 +37,10 @@ const DSH_HOME = typeof process.env.DSH_HOME === 'string' && process.env.DSH_HOM
   ? process.env.DSH_HOME
   : join(homedir(), '.dsh')
 const SESSIONS_ROOT = join(DSH_HOME, 'sessions')
+/** 真实 profile（只读）：R1 的 plugin 候选包从这里扫。 */
+const PROFILE_DIR = join(DSH_HOME, 'profiles', 'web')
+/** profile 候选包是否可扫：缺失时 `subagent` 的"多包歧义"在结构上不可能存在（见 E2E②）。 */
+const PROFILE_AVAILABLE = existsSync(join(PROFILE_DIR, 'node_modules'))
 const SENTINEL = 'LEDGER-PRIVACY-SENTINEL-8f3a'
 
 /** 本机真实技能目录（与当前会话 catalog 同源；E2E 只用于补齐成本侧形状）。 */
@@ -88,8 +92,13 @@ const skip = host === null
  * @returns {Promise<Array<{name: string, description: string}> | null>}
  */
 async function readDeclaredTools(logPath) {
-  const child = spawn('zstd', ['-dc', logPath], { stdio: ['ignore', 'pipe', 'ignore'] })
-  const iface = createInterface({ input: child.stdout, crlfDelay: Infinity })
+  // `.zstd` 走系统解压；未压缩的 `.jsonl`（本文件里的冻结快照）直接读——
+  // 冻结快照不能用 `zstd -dc` 读（对未压缩输入 zstd 会以 1 退出）。
+  const child = logPath.endsWith('.zstd')
+    ? spawn('zstd', ['-dc', logPath], { stdio: ['ignore', 'pipe', 'ignore'] })
+    : null
+  const input = child === null ? createReadStream(logPath) : child.stdout
+  const iface = createInterface({ input, crlfDelay: Infinity })
   try {
     for await (const line of iface) {
       let record
@@ -111,7 +120,7 @@ async function readDeclaredTools(logPath) {
     return null
   } finally {
     iface.close()
-    child.kill()
+    child?.kill()
   }
 }
 
@@ -150,6 +159,8 @@ test('E2E②：真实日志 → 真实声明面 → 零调用清单，且输出�
     skills: { list: async () => REAL_SKILLS },
     tools: { schemas: () => declared },
     dshHome: DSH_HOME,
+    profileDir: PROFILE_DIR,
+    coreScopeDir: host.resolveCoreScopeDir(),
   }, { cwd: WORKSPACE, sessions: 20 })
 
   // 证据位与观测规模
@@ -208,6 +219,121 @@ test('E2E②：真实日志 → 真实声明面 → 零调用清单，且输出�
   assert.deepEqual(offenders, [])
   assert.equal(JSON.stringify(report).includes(SENTINEL), false)
   assert.equal(renderLedger(report).includes(SENTINEL), false)
+
+  // ── R1：真机归属与可执行候选 ──
+  const byName = new Map(report.items.map(item => [item.id, item]))
+  const attributable = report.items.filter(item => item.category === 'tools' || item.category === 'mcp')
+  assert.ok(attributable.length > 0)
+  for (const item of attributable) {
+    const providedBy = item.providedBy
+    assert.ok(['plugin', 'core', 'mcp-server', 'unknown'].includes(providedBy.kind))
+    if (providedBy.kind === 'plugin') assert.match(providedBy.name, /^(@[A-Za-z0-9-_.~]+\/)?[A-Za-z0-9-_.~]{1,214}$/)
+    if (providedBy.kind === 'mcp-server') assert.equal(providedBy.name, 'openviking')
+    if (providedBy.kind === 'core' || providedBy.kind === 'unknown') assert.equal(providedBy.name, null)
+    if (providedBy.kind !== 'unknown') assert.deepEqual(providedBy.candidates, [])
+  }
+  // 已知盲区：`subagent` 在弱级是歧义（多包命中），必须如实记 unknown 并列出候选，不得猜测。
+  // 携带项②（t14）：`DSH_HOME` 下没有 `profiles/web` 时 profile 候选为空，歧义在结构上不可能存在，
+  // 此时它只会落到 core/unknown——旧断言写死 `unknown` 会误报环境差异。
+  // 处理：把"恒成立"的那条（**绝不猜成单一插件**）无条件断言；"有 profile 候选"时才断言完整的
+  // 歧义形状（unknown + static-scan-weak + 非空 candidates）。断言的实质强度不变，只去掉环境依赖。
+  const subagent = byName.get('tools:subagent')
+  if (subagent !== undefined) {
+    assert.notEqual(subagent.providedBy.kind, 'plugin', '歧义名字绝不允许被猜成单一插件')
+    assert.equal(subagent.providedBy.name, null)
+    if (PROFILE_AVAILABLE) {
+      assert.equal(subagent.providedBy.kind, 'unknown')
+      assert.equal(subagent.providedBy.method, 'static-scan-weak')
+      assert.ok(subagent.providedBy.candidates.length > 0)
+    } else {
+      assert.ok(['core', 'unknown'].includes(subagent.providedBy.kind))
+    }
+  }
+  // 携带项①（t14）：**防退化守卫**——若 DSH_HOME 指错/核心根解析失败，归属侧会整体退化为
+  // "无候选"，后续关于 providedBy / prunePlan 的断言就会静默恒真（扫描 0 包 0 文件也能通过）。
+  // 因此这里把"确实扫到了东西"变成硬断言，而不是只断言被扫描数据的形状。
+  assert.ok(report.scope.providerScan.packages > 0, '归属扫描必须真的扫到候选包（否则归属断言会静默恒真）')
+  assert.ok(report.scope.providerScan.files > 0, '归属扫描必须真的读到源码文件')
+  assert.equal(typeof report.scope.providerScan.capped, 'boolean')
+  if (PROFILE_AVAILABLE) {
+    assert.ok(report.items.some(item => item.providedBy?.kind === 'plugin'), '有 profile 候选时应至少归属出一个插件包')
+  }
+
+  // prunePlan：只含有证据的零调用项，且省额 = 这些项自身 tokens 之和
+  const pruneTokens = report.findings.prunePlan.reduce((sum, entry) => sum + entry.reclaimableTokens, 0)
+  const pruneItems = report.findings.prunePlan.reduce((sum, entry) => sum + entry.itemCount, 0)
+  const noRecItems = report.findings.noRecommendation.reduce((sum, entry) => sum + entry.items, 0)
+  const noRecTokens = report.findings.noRecommendation.reduce((sum, entry) => sum + entry.tokens, 0)
+  assert.equal(report.findings.prunePlanReclaimableTokens, pruneTokens)
+  assert.equal(pruneItems + noRecItems, report.totals.zeroCallItems)
+  assert.equal(pruneTokens + noRecTokens, report.totals.zeroCallTokens)
+  for (const entry of report.findings.prunePlan) {
+    assert.ok(entry.kind === 'plugin' || entry.kind === 'mcp-server')
+    assert.equal(entry.reclaimableTokens, entry.items.reduce((sum, item) => sum + item.tokens, 0))
+    assert.equal(entry.itemCount, entry.items.length)
+    if (entry.kind === 'mcp-server') assert.deepEqual(entry.factPackages, [])
+    else assert.ok(entry.factPackages.length >= 1)
+  }
+  const pruneIds = report.findings.prunePlan.flatMap(entry => entry.items.map(item => item.id))
+  assert.equal(new Set(pruneIds).size, pruneIds.length) // 同一项不重复计入
+  // 不可观测（calls === null）的项绝不进候选
+  for (const entry of report.findings.prunePlan) {
+    for (const item of entry.items) {
+      assert.equal(byName.get(item.id).zeroCall, true)
+    }
+  }
+  // ── R6（v3）：真机隐藏候选 ──
+  const hideFindings = report.findings
+  assert.equal(report.version, 3)
+  assert.equal(hideFindings.hidePlanBasis, 'model-tool-calls-only')
+  // H1/H2/H3：可隐藏 token = 全部零调用工具的自身 token 之和
+  assert.equal(hideFindings.hidePlanTokens, hideFindings.hidePlan.reduce((sum, entry) => sum + entry.tokens, 0))
+  assert.equal(hideFindings.hidePlanTokens, report.totals.zeroCallTokens)
+  assert.equal(hideFindings.hidePlan.length, report.items.filter(item => item.zeroCall === true
+    && (item.category === 'tools' || item.category === 'mcp')).length)
+  // H4：单元汇总守恒
+  assert.equal(hideFindings.hidePlanUnits.reduce((sum, unit) => sum + unit.tokens, 0), hideFindings.hidePlanTokens)
+  assert.equal(hideFindings.hidePlanUnits.reduce((sum, unit) => sum + unit.toolCount, 0), hideFindings.hidePlan.length)
+  // H6：denyList 与 skipped 是候选集合的一个划分
+  assert.equal(hideFindings.hideApply.denyList.length + hideFindings.hideApply.skipped.length, hideFindings.hidePlan.length)
+  // 三态（§2.23.3 第 3 行）：本用例注入的假 tools 服务**没有** `restrict`/`view`
+  // ⇒ 如实降级为 `unsupported`；候选照列（仍是有效诊断），但绝不抛错、绝不给可照抄的 denyList。
+  // （`unvalidated` 与 `prechecked` 两态在 test/host.test.js 用带接口的假 ctx 覆盖。）
+  assert.equal(hideFindings.hidePlanStatus, 'unsupported')
+  assert.equal(hideFindings.hideApply.interfacePresent, false)
+  assert.deepEqual(hideFindings.hideApply.denyList, [])
+  assert.equal(hideFindings.hideApply.applySupported, false)
+  // H4 硬约束：默认只建议，永不自动施加
+  assert.equal(hideFindings.hideApply.mode, 'suggestion-only')
+  assert.deepEqual(hideFindings.hideApply.appliedNames, [])
+  // 每个候选都带 registryUse（含 verdictBasis）与 precheck
+  for (const entry of hideFindings.hidePlan) {
+    assert.equal(entry.registryUse.verdict, 'unconfirmed')
+    assert.equal(entry.registryUse.verdictBasis, 'no-non-model-observability')
+    assert.equal(entry.registryUse.modelCalls, 0)
+    assert.equal(entry.precheck.restrictable, null) // 未校验绝不能用 false 冒充
+    assert.equal(entry.precheck.reason, 'interface-absent')
+  }
+  // 与 prunePlan 并存且不改其字段；两个动作的 token 不得相加
+  assert.equal(hideFindings.prunePlanBasis, 'model-tool-calls-only')
+  assert.ok(hideFindings.hidePlanTokens >= hideFindings.prunePlanReclaimableTokens)
+  const r6Render = renderLedger(report)
+  assert.match(r6Render, /Hide candidates \(tool level\) — needs manual confirmation: \d+ tokens/)
+  assert.match(r6Render, /Hide caveats: registry-level hide, not schema-only;/)
+  assert.match(r6Render, /Do not add the hide tokens to the uninstall candidates/)
+  assert.equal(r6Render.includes(String(hideFindings.hidePlanTokens + hideFindings.prunePlanReclaimableTokens)), false)
+  assert.equal(r6Render.includes(SENTINEL), false)
+  assert.deepEqual(whitelistOffenders(report), [])
+
+  t.diagnostic(`providerScan: ${JSON.stringify(report.scope.providerScan)}`)
+  t.diagnostic(`hidePlan: ${hideFindings.hidePlanTokens} tokens / ${hideFindings.hidePlan.length} tools /`
+    + ` status=${hideFindings.hidePlanStatus} / mode=${hideFindings.hideApply.mode} /`
+    + ` 单元=${hideFindings.hidePlanUnits.map(unit => `${unit.kind}:${unit.target ?? '-'}(${unit.tokens})`).join(' ')}`)
+  t.diagnostic(`prunePlan（真实数据）:\n${report.findings.prunePlan.map(entry =>
+    `  - ${entry.kind} ${entry.target}: ${entry.itemCount} tools, ${entry.reclaimableTokens} tokens,`
+    + ` usedToolCount=${entry.usedToolCount}, confidence=${entry.confidence}`
+    + (entry.factPackages.length > 0 ? `, factPackages=${entry.factPackages.join('|')}` : '')).join('\n')}`)
+  t.diagnostic(`noRecommendation: ${JSON.stringify(report.findings.noRecommendation)}`)
 })
 
 test('E2E③：S2 载荷不变性差分证明（真实日志 + 哨兵副本）', { skip }, async () => {
@@ -230,24 +356,48 @@ test('E2E③：S2 载荷不变性差分证明（真实日志 + 哨兵副本）',
     const record = JSON.parse(line)
     return JSON.stringify(sentinelize(record, 'root'))
   })
+  // S2 的两份输入都必须**冻结**：基准副本 + 哨兵副本。
+  // 活动会话日志在测试执行期间仍在增长；若只冻结一份、另一份去重读活文件，
+  // 断言就退化成"同一活文件读两次并比较"，会随窗口漂移而 flaky（t11 修复）。
+  const basePath = join(tmpRoot, 'baseline.jsonl')
+  writeFileSync(basePath, `${lines.join('\n')}\n`)
   writeFileSync(copyPath, `${rewritten.join('\n')}\n`)
+  // 报告侧也只喂冻结快照：临时 DSH_HOME 下只放这一个会话目录
+  const frozenHome = join(tmpRoot, 'home')
+  mkdirSync(join(frozenHome, 'sessions', WORKSPACE_KEY, 'sess-frozen'), { recursive: true })
+  writeFileSync(join(frozenHome, 'sessions', WORKSPACE_KEY, 'sess-frozen', 'session.v4.jsonl'), `${lines.join('\n')}\n`)
 
-  const usageOriginal = await host.readSessionUsage(source, MAX_LINES_PER_SESSION)
+  const usageOriginal = await host.readSessionUsage(basePath, MAX_LINES_PER_SESSION)
   const usageCopy = await host.readSessionUsage(copyPath, MAX_LINES_PER_SESSION)
-  // 载荷变了，计数一模一样
+  // 载荷变了，计数一模一样（两份输入都冻结 ⇒ 断言确定）
   assert.deepEqual(usageCopy, usageOriginal)
   assert.equal(usageOriginal.linesRead, lines.length)
   assert.ok(usageOriginal.toolCalls > 0)
 
   // 用同一份成本表、同一份 scope 分别对账：除 generatedAt 外逐字节相同
-  const declared = await readDeclaredTools(source)
+  // 报告侧也只用冻结输入（frozenHome），于是下面的 prunePlan 交叉断言同样在
+  // "两份冻结派生"之间成立——全程不再读任何活会话日志。
+  const declared = await readDeclaredTools(basePath)
+  // 防静默退化：冻结快照里必须真的读到声明面（否则 S2 就变成"空对空"）
+  assert.ok(declared !== null && declared.length > 0, '冻结基准快照应含 request/header 的 tools 声明')
   const report = await host.gatherLedger({
     fs: realFs,
     skills: { list: async () => REAL_SKILLS },
     tools: { schemas: () => declared },
-    dshHome: DSH_HOME,
+    dshHome: frozenHome,
+    profileDir: PROFILE_DIR,
+    coreScopeDir: host.resolveCoreScopeDir(),
   }, { cwd: WORKSPACE, sessions: 1 })
   const costItems = report.items
+  assert.ok(costItems.some(item => item.category === 'tools'), '差分报告的成本侧必须含工具项')
+  // 从真机报告里复原归属输入，让差分报告与真机报告形状一致
+  const byName = Object.fromEntries(report.items.filter(item => item.providedBy).map(item => [item.name, item.providedBy]))
+  const manifest = host.readProfileManifest(PROFILE_DIR)
+  const facts = [...new Set(Object.values(byName).filter(entry => entry.kind === 'plugin').map(entry => entry.name))]
+  const provenance = {
+    byName,
+    bundleOwners: host.resolveBundleOwners(PROFILE_DIR, facts, manifest === null ? [] : manifest.removable),
+  }
   const scope = {
     workspaceKey: WORKSPACE_KEY,
     sessionsAvailable: report.scope.sessionsAvailable,
@@ -262,12 +412,62 @@ test('E2E③：S2 载荷不变性差分证明（真实日志 + 哨兵副本）',
     truncated: usageOriginal.truncated,
   }
   const { reconcile } = await import('../lib/reconcile.js')
-  const fromOriginal = reconcile({ cwd: WORKSPACE, sessionsRoot: SESSIONS_ROOT, scope, callsByName: usageOriginal.callsByName, items: costItems })
-  const fromCopy = reconcile({ cwd: WORKSPACE, sessionsRoot: SESSIONS_ROOT, scope, callsByName: usageCopy.callsByName, items: costItems })
+  const fromOriginal = reconcile({ cwd: WORKSPACE, sessionsRoot: SESSIONS_ROOT, scope, callsByName: usageOriginal.callsByName, provenance, items: costItems })
+  const fromCopy = reconcile({ cwd: WORKSPACE, sessionsRoot: SESSIONS_ROOT, scope, callsByName: usageCopy.callsByName, provenance, items: costItems })
   assert.equal(normalize(fromCopy), normalize(fromOriginal))
   assert.equal(renderLedger(fromCopy), renderLedger(fromOriginal))
   assert.equal(JSON.stringify(fromOriginal).includes(SENTINEL), false)
   assert.deepEqual(whitelistOffenders(fromOriginal), [])
+  // 携带项①（t14）防退化守卫：`fromOriginal.findings.prunePlan` 与真机报告比对时，
+  // 若归属扫描整体退化（0 包 0 文件），两侧都会是 []，断言会**静默恒真**。
+  // 这里先把"确实归属到了东西"变成硬断言——与真机侧同一条守卫。
+  assert.ok(report.scope.providerScan.packages > 0, '差分侧同样要求归属扫描真的扫到候选包')
+  assert.ok(report.scope.providerScan.files > 0)
+  assert.ok(Object.keys(provenance.byName).length > 0, '归属通道不得为空（否则差分断言静默成立）')
+  assert.ok(costItems.some(item => item.providedBy !== undefined))
+  // 归属与省额也和真机报告一致。报告侧同样只读冻结快照（frozenHome），
+  // 因此这条断言也在"两份冻结派生"之间成立，不再随活文件漂移（t11）。
+  assert.deepEqual(fromOriginal.findings.prunePlan, report.findings.prunePlan)
+})
+
+test('E2E⑤：S2 夹具纪律（回归测试）——输入不冻结就会漂移，冻结后免疫', { skip }, async () => {
+  // 这份用例把 t11 的根因**复现**成可断言的形态，不碰任何真实会话日志：
+  // ① 旧写法（读活文件两次并比较）在活文件被追加后必然失败；
+  // ② 新写法（基准副本 + 哨兵副本都冻结）对后续追加免疫。
+  const tmpRoot = mkdtempSync(join(tmpdir(), 'context-ledger-drift-'))
+  tmpRoots.push(tmpRoot)
+  const livePath = join(tmpRoot, 'live.jsonl')
+  const basePath = join(tmpRoot, 'baseline.jsonl')
+  const copyPath = join(tmpRoot, 'sentinel.jsonl')
+
+  const line = (type, data) => JSON.stringify({ type, seq: 1, time: 1, data })
+  const seed = [
+    line('session', { id: 'sess-drift' }),
+    line('tool/call', { callId: 'c1', name: 'bash', arguments: { secret: SENTINEL } }),
+    line('tool/result', { message: SENTINEL }),
+  ]
+  writeFileSync(livePath, `${seed.join('\n')}\n`)
+  // 冻结：基准副本（原载荷）+ 哨兵副本（载荷替换）
+  const snapshot = seed
+  writeFileSync(basePath, `${snapshot.join('\n')}\n`)
+  writeFileSync(copyPath, `${snapshot.map(entry => JSON.stringify(sentinelize(JSON.parse(entry), 'root'))).join('\n')}\n`)
+
+  // 快照之后，活文件又被追加了一次 tool/call（模拟并发团队的持续写入）
+  writeFileSync(livePath, `${[...seed, line('tool/call', { callId: 'c2', name: 'read', arguments: {} })].join('\n')}\n`)
+
+  const liveFirst = await host.readSessionUsage(livePath, MAX_LINES_PER_SESSION)
+  const liveSecond = await host.readSessionUsage(livePath, MAX_LINES_PER_SESSION)
+  const base = await host.readSessionUsage(basePath, MAX_LINES_PER_SESSION)
+  const copy = await host.readSessionUsage(copyPath, MAX_LINES_PER_SESSION)
+
+  // ① 活文件在增长：两次读取确实会不一致（这正是旧断言 flaky 的机制）
+  assert.equal(liveFirst.toolCalls, liveSecond.toolCalls, '同一次读取之间不应变化')
+  assert.notDeepEqual(liveSecond, base, '活文件在快照后增长 ⇒ 与快照必然不同（旧写法的失败模式）')
+  assert.equal(liveSecond.toolCalls, base.toolCalls + 1)
+  // ② 冻结的两份输入不受后续追加影响，S2 断言因此确定
+  assert.deepEqual(copy, base)
+  assert.equal(copy.linesRead, base.linesRead)
+  assert.equal(JSON.stringify(copy).includes(SENTINEL), false)
 })
 
 test('E2E④：scanInstructionChain 在真实磁盘上工作（去重 / loadOrder / 体积上限）', { skip }, async (t) => {
@@ -308,6 +508,8 @@ test('E2E④：scanInstructionChain 在真实磁盘上工作（去重 / loadOrde
     skills: { list: async () => REAL_SKILLS },
     tools: { schemas: () => [{ name: 'bash', description: 'Run a shell command.' }] },
     dshHome: DSH_HOME,
+    profileDir: PROFILE_DIR,
+    coreScopeDir: host.resolveCoreScopeDir(),
   }, { cwd: WORKSPACE, sessions: 1 })
   const instructions = report.items.filter(item => item.category === 'instructions')
   for (const item of instructions) {

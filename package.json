@@ -1,6 +1,6 @@
 {
   "name": "dsh-context-ledger",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "private": true,
   "type": "module",
   "description": "DSH 上下文账本：把每个请求常驻注入的 token 成本，与实际调用次数对账，找出「贵且没用」的注入物。只读，零第三方依赖。",

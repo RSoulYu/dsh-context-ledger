@@ -3927,7 +3927,7 @@ test('I9. 面板文案实况（人读用）：R8 的窗口口径 / 本会话 / �
  * ══════════════════════════════════════════════════════════════════════════ */
 
 /** `DESIGN.md` 原文：夹具保真比对的唯一真源（只读）。 */
-const DESIGN_SRC = readFileSync(join(REPO, 'DESIGN.md'), 'utf8')
+const DESIGN_SRC = readFileSync(join(REPO, 'docs', 'DESIGN.md'), 'utf8')
 
 /** 从某个小节标题之后抽出第一个 ```jsonc 代码块并解析（解析失败即显式失败，不静默跳过）。 */
 function designJsoncBlock(sectionMarker) {
@@ -3968,8 +3968,11 @@ function fingerprintOf(value) {
  * 它是**有意的闸门**：`DESIGN.md` §2.21 或 `R6_EXAMPLE` 夹具只要漂移一个字节（含数组顺序），
  * J2 就会失败并打印本常量与两侧实际值。若漂移是**有意的契约变更**，必须同一步更新：
  * ① `DESIGN.md` §2.21、② 本文件的 `R6_EXAMPLE`、③ 本常量。
+ *
+ * 2026-10-08：发布前的路径脱敏把示例中的本机绝对路径换成通用路径，DESIGN 与夹具同步改写
+ * （J1 仍 13/13 SAME），指纹随之更新。
  */
-const SECTION_21_FINGERPRINT = 'cc5e143e4399e0cb6878efb9facbed09687d7c9fbe2572a80274bec889ac4a36'
+const SECTION_21_FINGERPRINT = '0f497be8b3ec8785eaa1e914aed558c37e31e069a8dd72656911439ce6e9bea7'
 
 /** 逐字段差异（返回人类可读的路径清单；失败信息里直接给出，避免"只知道不相等"）。 */
 function describeDiffs(design, fixture, path) {

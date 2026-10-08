@@ -547,7 +547,7 @@ test('黄金样例：canonical 形状——顶层 11 键、项字段顺序、无
   assert.match(report.generatedAt, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/)
   assert.deepEqual(Object.keys(report.scope), [
     'workspaceKey', 'sessionsRoot', 'sessionsAvailable', 'sessionsScanned', 'sessionsUnreadable',
-    'sessionsLimit', 'sessionsOutsideWindow', 'windowStart', 'windowEnd', 'windowBasis', 'currentSession',
+    'sessionsLimit', 'sessionsOutsideWindow', 'windowStart', 'windowEnd', 'windowBasis', 'measureBasis', 'currentSession',
     'linesRead', 'toolCalls', 'skillToolCalls',
     'callsUnmatched', 'callsUnmatchedNames', 'namesRejected', 'usageAvailable', 'truncated', 'providerScan',
   ])

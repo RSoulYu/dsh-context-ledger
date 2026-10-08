@@ -27,6 +27,11 @@ R6 **只输出建议、不自动施加**（§2.23.4）。逐条见 §8。
 `items[].currentSessionCalls` / `items[].sessionsWithCalls` / `items[].callPresence`、
 `scope.currentSession` / `scope.windowBasis` / `scope.sessionsOutsideWindow`、
 `totals.currentSessionObservedCalls`、`findings.zeroCallBasis` 为 v4 新增（§2.2、§2.4、§2.6、§2.26）；
+**v4 → v5 的变更（实现线必须同步）**：新增必需字段 `scope.measureBasis`（枚举，§2.2）；
+**`items[].tokens` / `items[].bytes` 的含义随之明确为"在 `measureBasis` 这个口径上量"**——
+PTC 传输下必须是系统提示里的 `tools:sdk` 声明，而不是 JSON schema（后者模型根本收不到，会低估约 4 倍）。
+非 PTC 或声明面读不到时退回 `"tool-schemas"`，值不得留空、更不得填 0。
+
 `scope.windowStart` / `windowEnd` 由"可为 null"收紧为**不变量**（§2.2 W1–W3）；
 `ReconcileInput` 补齐 R6 与 v4 的输入通道（§7.1，一并收口 F2/C1）。逐条见 §8。
 **v4 的语义要点**：`calls` 仍是**扫描窗口内**的调用总数（**不是**穷尽磁盘），v4 只是把这个口径**显式化**并加上"本会话 / 覆盖会话数"两个维度；`zeroCall` 语义**一字未改**。
@@ -118,6 +123,7 @@ v4 把"调用次数"这一个数字**拆成三个互不可加的维度**，并�
 | `windowStart` | string \| null | 被**成功回放**的会话中，日志文件 `mtime` 最早者（ISO-8601 UTC）；`null` 仅当 `sessionsScanned === 0`（下详） |
 | `windowEnd` | string \| null | 同上，日志文件 `mtime` 最晚者（ISO-8601 UTC）；`null` 仅当 `sessionsScanned === 0` |
 | `windowBasis` | string | **v4 新增**：常量 `"session-log-mtime"`——**窗口边界的证据来源**：被成功回放的会话**日志文件的 mtime**（文件系统元数据）。**禁止**把它读成"日志内的时间戳"：行内 `time` 字段属未授权读取面（§3.1、§3.8） |
+| `measureBasis` | string（枚举） | **v5 新增**：`items[].tokens` / `items[].bytes` 是在**哪个口径**上量的。`"system-prompt-declaration"` = PTC 传输下模型真正收到的系统提示 `tools:sdk` 声明（`lib/ptc.js`）；`"tool-schemas"` = 退回按 JSON schema 估算（非 PTC，或声明面读不到）。**两个口径不可混用**：同一批工具在 PTC 下按 schema 量会低估约 4 倍（2026-10-08 实测 7,886 vs 20,947） |
 | `currentSession` | object | **v4 新增**：本次对账所属会话的身份与窗口覆盖状态（§2.26.2）；子字段全部必需 |
 | `linesRead` | integer | 实际检视的 JSONL 行数（含被丢弃的行） |
 | `toolCalls` | integer | 判定为 `tool/call` 的行数；恒等于 `Σ items[].calls(非空) + callsUnmatched + namesRejected`（= 观测到的一切工具调用） |

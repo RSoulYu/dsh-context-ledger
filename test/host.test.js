@@ -774,7 +774,7 @@ test('apply：注册 context_ledger 工具并挂载可选 webServer 路由', { s
   assert.equal(outputSchema.properties.scope.additionalProperties, false)
   assert.deepEqual(Object.keys(outputSchema.properties.scope.properties), [
     'workspaceKey', 'sessionsRoot', 'sessionsAvailable', 'sessionsScanned', 'sessionsUnreadable',
-    'sessionsLimit', 'sessionsOutsideWindow', 'windowStart', 'windowEnd', 'windowBasis', 'currentSession',
+    'sessionsLimit', 'sessionsOutsideWindow', 'windowStart', 'windowEnd', 'windowBasis', 'measureBasis', 'currentSession',
     'linesRead', 'toolCalls', 'skillToolCalls',
     'callsUnmatched', 'callsUnmatchedNames', 'namesRejected', 'usageAvailable', 'truncated', 'providerScan',
   ])

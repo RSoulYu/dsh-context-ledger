@@ -4,6 +4,35 @@
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
 ---
+## [0.5.0] — 2026-10-08
+
+### 新增
+
+- **`scope.measureBasis`：常驻成本在哪个口径上量**（枚举，canonical 契约 v5）。
+  `"system-prompt-declaration"` = PTC 传输下模型真正收到的**系统提示 `tools:sdk` 声明**；
+  `"tool-schemas"` = 退回按 JSON schema 估算。
+- **`lib/ptc.js`**：从系统提示解析声明面（`system/message` → `data.message.content[0].text`），
+  按「名字行 + **紧随其后的文档注释归下一条**」切分 ToolArgsMap / ToolOutputMap，同名两段合并。
+- 声明面读取**依次尝试最近 3 个会话**：最新那个可能正在被写入，单次读取会取不到
+  （实测：同一份日志单独读成功、作为"最新会话"读返回 null）。
+
+### 修复（本次改动的**起因**）
+
+- **PTC 下常驻成本被系统性低估**。此前 `items[].tokens` 量的是 JSON schema，
+  而 PTC 传输下 schema **不在线上传输**——模型看到的是系统提示里的声明。
+  实测对照：同一批工具按 schema 量 **7,886**，按声明面量 **20,947**；
+  移除 11 个工具的**差值** 972 vs 3,866（约 4 倍）。
+  现在 `tokens` / `bytes` / `totals.residentTokens` 都在 `measureBasis` 这个口径上量，
+  两个独立实现（本插件与一次性测量脚本）逐工具对齐。
+- 读不到声明面时**如实退回 `"tool-schemas"` 并声明**，不猜、不填 0。
+
+### 测试
+
+- **184 通过 / 0 失败**（新增 4 条 `lib/ptc.js` 的回归用例：非 PTC 返回 null、
+  文档注释归属下一条、同名两段合并、口径常量冻结）。
+- 契约断言同步：`scope` 键列表与输出 schema 增加 `measureBasis`。
+
+---
 ## [0.4.1] — 2026-10-08
 
 ### 文档

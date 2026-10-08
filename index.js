@@ -19,6 +19,7 @@ import { dirname, extname, join } from 'node:path'
 import { createInterface } from 'node:readline'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { instructionItems, skillItems, toolItems } from './lib/cost.js'
+import { DECLARATION_BASIS, SCHEMA_BASIS, readDeclaredFace } from './lib/ptc.js'
 import {
   HIDE_MODES, HIDE_PLAN_BASIS, HIDE_PLAN_CAVEAT, PRECHECK_REASONS, PRECHECK_STATUSES,
   REGISTRY_USE_BASIS, REGISTRY_USE_VERDICTS, RESERVED_TOOL_NAMES, normalizeNameCollection,
@@ -28,7 +29,7 @@ import {
   PROVIDED_BY_CONFIDENCE, PROVIDED_BY_KINDS, PROVIDED_BY_METHODS,
   attributeNames, scanCorpus,
 } from './lib/provide.js'
-import { FINDINGS_LIMIT, LEDGER_TOOL, LEDGER_UNIT, LEDGER_VERSION, SESSION_LOG_MTIME_BASIS, ZERO_CALL_BASIS, CALL_PRESENCE, CURRENT_SESSION_BASES, reconcile, renderLedger } from './lib/reconcile.js'
+import { FINDINGS_LIMIT, LEDGER_TOOL, LEDGER_UNIT, LEDGER_VERSION, SESSION_LOG_MTIME_BASIS, ZERO_CALL_BASIS, CALL_PRESENCE, CURRENT_SESSION_BASES, reconcile, renderLedger  } from './lib/reconcile.js'
 import { ESTIMATOR } from './lib/tokens.js'
 import { MAX_LINES_PER_SESSION, createUsageCounter, isValidToolName, projectKey } from './lib/usage.js'
 
@@ -84,6 +85,9 @@ export function resolveDshHome(env = process.env) {
  * @param {string} dshHome
  * @returns {string}
  */
+/** 声明面读取时往前退几个会话（最新会话可能正在被写入）。 */
+const DECLARED_FACE_CANDIDATES = 3
+
 export function sessionsRootOf(dshHome) {
   return join(dshHome, 'sessions')
 }
@@ -812,6 +816,35 @@ export async function gatherLedger(deps, options) {
   const sessionsLimit = clampSessions(options.sessions)
   const dshHome = typeof deps.dshHome === 'string' && deps.dshHome !== '' ? deps.dshHome : resolveDshHome()
 
+  // 会话清单（只 stat 目录项，不读内容）——成本侧要先用它定位"最新会话"，
+  // 因为 PTC 下声明面**只在系统提示里**，而系统提示要按会话日志取。
+  const workspaceKey = projectKey(cwd)
+  const sessionsRoot = sessionsRootOf(dshHome)
+  const available = listWorkspaceSessions(sessionsRoot, workspaceKey)
+  const selected = available.slice(0, sessionsLimit)
+
+  // ── 0. 声明面（v5）：PTC 下量系统提示里的 tools:sdk，而不是 JSON schema ──
+  // 这是一次**独立的**流式读取（只取首个 system/message 即返回），不是 §3.8 那三个
+  // 计数投影的一部分；三个投影仍严格出自下面唯一的一次回放。
+  /** @type {{byName: Record<string, {chars: number, tokens: number}>, totalTokens: number, toolCount: number} | null} */
+  let declaredFace = null
+  let measureBasis = SCHEMA_BASIS
+  try {
+    // 依次尝试最近几个会话：**最新那个可能正在被写入**，单次读取会因日志不完整而取不到
+    // （2026-10-08 实测：同一份日志单独读成功、作为"最新会话"读却返回 null）。
+    // 声明面只随"工具集"变化，往前退一两个会话不影响结论。
+    for (const entry of available.slice(0, DECLARED_FACE_CANDIDATES)) {
+      if (signal?.aborted === true) break
+      if (typeof entry?.logPath !== 'string') continue
+      declaredFace = await readDeclaredFace(entry.logPath, MAX_LINES_PER_SESSION, signal)
+      if (declaredFace !== null) { measureBasis = DECLARATION_BASIS; break }
+    }
+  } catch {
+    // 量不到就如实退回 schema 口径，不猜、不填 0。
+    declaredFace = null
+    measureBasis = SCHEMA_BASIS
+  }
+
   // ── 1. 成本侧 ────────────────────────────────────────────────────────────
   const schemas = visibleSchemas(deps.tools, options.agent)
 
@@ -839,7 +872,7 @@ export async function gatherLedger(deps, options) {
   const items = [
     ...instructionItems(instructions.files, instructions.root),
     ...skillItems(modelSkills),
-    ...toolItems(schemas),
+    ...toolItems(schemas, declaredFace),
   ]
 
   // ── 1b. 归属扫描（R1）：只扫 tools / mcp 项的名字 ────────────────────────
@@ -875,10 +908,6 @@ export async function gatherLedger(deps, options) {
   }
 
   // ── 2. 使用侧：会话日志回放（只取工具名与计数） ──────────────────────────
-  const workspaceKey = projectKey(cwd)
-  const sessionsRoot = sessionsRootOf(dshHome)
-  const available = listWorkspaceSessions(sessionsRoot, workspaceKey)
-  const selected = available.slice(0, sessionsLimit)
   // v4（§3.8 第 2 条）：三个投影**全部**出自下面这一次逐会话回放——
   // 窗口总量（`counts`）/ 覆盖会话数（`coverage`）/ 本会话次数（`currentSessionCounts`）。
   // **不得**为任何一项另开读取路径（不重新解压、不换计数函数、不 stat 以外的读盘）。
@@ -958,6 +987,10 @@ export async function gatherLedger(deps, options) {
       windowEnd: newest === null ? null : new Date(newest).toISOString(),
       // 窗口边界**只**来自日志文件 mtime（文件系统元数据）；不读行内 `time`（§2.2 第 4 条）。
       windowBasis: SESSION_LOG_MTIME_BASIS,
+      // §2.2（v5）：`items[].tokens` / `bytes` 是在**哪个口径**上量的。
+      // `system-prompt-declaration` = PTC 下模型真正收到的 tools:sdk 声明；
+      // `tool-schemas` = 退回按 JSON schema 估算（非 PTC，或声明面读不到）。
+      measureBasis,
       currentSession: { id: identity.id, basis: identity.basis, inWindow },
       linesRead,
       toolCalls,
@@ -1219,6 +1252,8 @@ function scopeSchema() {
       windowStart: nullableTimestamp,
       windowEnd: nullableTimestamp,
       windowBasis: { type: 'string', const: SESSION_LOG_MTIME_BASIS },
+      // v5：常驻口径（枚举，不是自由字符串——它决定上面每个 tokens 的含义）
+      measureBasis: { type: 'string', enum: [SCHEMA_BASIS, DECLARATION_BASIS] },
       currentSession: currentSessionSchema(),
       linesRead: { type: 'integer' },
       toolCalls: { type: 'integer' },

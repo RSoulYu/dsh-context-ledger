@@ -112,6 +112,22 @@ context_ledger sessions=60              # 扩大会话日志回放窗口（默�
 context_ledger detail=developer         # 附带逐条证据回执
 ```
 
+> ⚠️ **模型工具自 v0.4.0 起按需启用、默认关闭。**
+> 原因：PTC 传输下这条声明**每次请求常驻约 1,725 token**，是全部 80 个工具里最大的一条
+> （返回类型声明一项就占整个 `ToolOutputMap` 的 32%），而 56 个会话里它被调用 **0 次**。
+>
+> 开启方式——在自己 profile 的 `cordis.patch.yml` 里给本插件加一行配置：
+>
+> ```yaml
+> - id: context-ledger
+>   config:
+>     tool:
+>       enabled: true
+> ```
+>
+> **HTTP 路由与面板不受影响**：它们与工具走同一个 `gatherLedger`，返回同一份 canonical JSON，
+> 所以不开启也能照常看面板、照常从路由取数。
+
 浏览器侧：在会话的 composer 工具行点击账本控件，展开面板。
 
 ---

@@ -756,7 +756,7 @@ test('apply：注册 context_ledger 工具并挂载可选 webServer 路由', { s
     get: () => undefined,
     inject: (deps, callback) => injections.push({ deps, callback }),
   }
-  host.apply(ctx, { defaultCwd: WORKSPACE })
+  host.apply(ctx, { defaultCwd: WORKSPACE, tool: { enabled: true } })
 
   assert.equal(registered.length, 1)
   const definition = registered[0]
@@ -928,7 +928,7 @@ test('apply：agent cwd 优先于 defaultCwd', { skip: hostSkip }, async () => {
     fs: makeFakeFs(),
     get: () => undefined,
     inject: () => {},
-  }, { defaultCwd: '/somewhere/else' })
+  }, { defaultCwd: '/somewhere/else', tool: { enabled: true } })
   const report = await registered[0].execute({}, {
     agent: { session: { header: { cwd: WORKSPACE } } },
     signal: undefined,
@@ -1362,4 +1362,21 @@ test('B1 · 非集合形状仍如实判 unsupported（Map / 普通对象 / undef
   assert.deepEqual(host.probeRestrict(empty, { id: 'agent' }), {
     status: 'prechecked', restrictableNames: [], interfacePresent: true,
   })
+})
+
+test('apply：模型工具默认不注册（2026-10-08 改为按需启用）', { skip: hostSkip }, async () => {
+  setupIsolatedHome()
+  const registered = []
+  const ctx = {
+    tools: { schemas: () => SCHEMAS, register: definition => registered.push(definition) },
+    skills: { list: async () => SKILLS },
+    fs: makeFakeFs(),
+    get: () => undefined,
+    inject: () => {},
+  }
+  host.apply(ctx, { defaultCwd: WORKSPACE })
+  assert.equal(registered.length, 0, '默认不应注册 context_ledger：PTC 模式常驻约 1725 token，56 会话调用 0 次')
+  host.apply(ctx, { defaultCwd: WORKSPACE, tool: { enabled: true } })
+  assert.equal(registered.length, 1, '显式开启后应注册')
+  assert.equal(registered[0].name, 'context_ledger')
 })

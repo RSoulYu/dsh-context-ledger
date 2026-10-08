@@ -1543,7 +1543,14 @@ export function apply(ctx, config = {}) {
   installHideApply(ctx, config, appliedByAgent)
 
   // 1. 模型工具：与 HTTP 路由返回同一份 canonical JSON（同一函数产出）。
-  ctx.tools.register(defineTool({
+  //    **按需启用（默认关闭）**：PTC 模式下这条声明每次请求常驻约 1,725 token，是全部 80 个
+  //    工具里最大的一条（返回类型声明一项就占整个 ToolOutputMap 的 32%），而 56 个会话里
+  //    它被调用 0 次。HTTP 路由与面板不受影响，随时可用同一份 canonical JSON。
+  //    开启方式：在自己 profile patch 里写 `config.tool.enabled: true`。
+  const toolEnabled = config !== null && typeof config === 'object' && config.tool !== null && typeof config.tool === 'object'
+    ? config.tool.enabled === true
+    : config !== null && typeof config === 'object' && config.toolEnabled === true
+  if (toolEnabled) ctx.tools.register(defineTool({
     name: LEDGER_TOOL,
     description: TOOL_DESCRIPTION,
     parameters: {

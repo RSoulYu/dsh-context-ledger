@@ -91,14 +91,35 @@ const skip = host === null
  * @param {string} logPath
  * @returns {Promise<Array<{name: string, description: string}> | null>}
  */
+/** 从 PTC 系统提示的 `tools:sdk` 段解析「声明面」（模型真正看到的那一份）。 */
+function parseSdkDeclared(promptText) {
+  const start = promptText.indexOf('interface ToolArgsMap')
+  if (start < 0) return null
+  const end = promptText.indexOf('\n}', start)
+  const block = promptText.slice(start, end < 0 ? promptText.length : end)
+  const out = []
+  const re = /(?:^ {2}\/\*\* (.*?) \*\/\n)?^ {2}([A-Za-z_][A-Za-z0-9_]*):/gm
+  let m
+  while ((m = re.exec(block)) !== null) {
+    out.push({ name: m[2], description: typeof m[1] === 'string' ? m[1] : '' })
+  }
+  return out.length > 0 ? out : null
+}
+
+/**
+ * 取「声明面」。
+ *
+ * **PTC 传输下 `request/header.tools` 只剩 `run_code`** —— 80 个工具的声明被搬进了系统提示的
+ * `tools:sdk` 段，只按老写法读会得到「1 个工具」的假声明面（2026-10-08 实测：该数组长度 1，
+ * 而工具实际有 80 个）。所以两路都看：优先系统提示，回落到 request/header（老日志与冻结夹具）。
+ */
 async function readDeclaredTools(logPath) {
-  // `.zstd` 走系统解压；未压缩的 `.jsonl`（本文件里的冻结快照）直接读——
-  // 冻结快照不能用 `zstd -dc` 读（对未压缩输入 zstd 会以 1 退出）。
   const child = logPath.endsWith('.zstd')
     ? spawn('zstd', ['-dc', logPath], { stdio: ['ignore', 'pipe', 'ignore'] })
     : null
   const input = child === null ? createReadStream(logPath) : child.stdout
   const iface = createInterface({ input, crlfDelay: Infinity })
+  let legacy = null
   try {
     for await (const line of iface) {
       let record
@@ -107,17 +128,26 @@ async function readDeclaredTools(logPath) {
       } catch {
         continue
       }
-      if (record === null || typeof record !== 'object' || record.type !== 'request/header') continue
+      if (record === null || typeof record !== 'object') continue
+      if (record.type === 'system/message') {
+        const text = record.data?.message?.content?.[0]?.text
+        if (typeof text === 'string' && text.includes('interface ToolArgsMap')) {
+          const parsed = parseSdkDeclared(text)
+          if (parsed !== null) return parsed
+        }
+        continue
+      }
+      if (record.type !== 'request/header' || legacy !== null) continue
       const declared = record.data?.header?.tools
       if (!Array.isArray(declared) || declared.length === 0) continue
-      return declared
+      legacy = declared
         .filter(entry => entry !== null && typeof entry === 'object' && typeof entry.name === 'string')
         .map(entry => ({
           name: entry.name,
           description: typeof entry.description === 'string' ? entry.description : '',
         }))
     }
-    return null
+    return legacy
   } finally {
     iface.close()
     child?.kill()
@@ -152,7 +182,9 @@ test('E2E①：本机真实日志可定位（跳过条件明确，不伪造数�
 
 test('E2E②：真实日志 → 真实声明面 → 零调用清单，且输出无任何正文片段', { skip }, async (t) => {
   const declared = await readDeclaredTools(sessions[0].logPath)
-  assert.ok(declared !== null && declared.length > 0, '真实日志里应有 request/header 的 tools 声明')
+  // 探针放在**取数来源**上：PTC 下只读 request/header 会得到 1 个工具（run_code），
+  // 这里要求成规模的声明面，能直接抓到「来源失效」这类问题。
+  assert.ok(declared !== null && declared.length >= 10, '真实日志里应能取到成规模的声明面（PTC 下须解析系统提示的 tools:sdk 段）')
 
   const report = await host.gatherLedger({
     fs: realFs,
@@ -234,7 +266,8 @@ test('E2E②：真实日志 → 真实声明面 → 零调用清单，且输出�
   )
 
   // 真实数据下确实存在「贵且没用」的注入物
-  assert.ok(report.totals.zeroCallItems > 0, '真实声明面里应有从未被调用的工具')
+  // 「零调用」数量是**环境快照**（会随清理而变化），不作契约断言；真正要守的是它与 items 自洽
+  // （见上方 findings.zeroCall 的集合断言）与声明面来源可用（见开头 declared.length 断言）。
   t.diagnostic(`sessions: ${report.scope.sessionsScanned}/${report.scope.sessionsAvailable}`
     + ` · lines: ${report.scope.linesRead} · toolCalls: ${report.scope.toolCalls}`
     + ` · skillToolCalls: ${report.scope.skillToolCalls} · namesRejected: ${report.scope.namesRejected}`)
